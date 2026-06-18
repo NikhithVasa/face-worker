@@ -48,6 +48,10 @@ DELETE_TEMP_ANNOTATED = os.environ.get("DELETE_TEMP_ANNOTATED", "false").lower()
 # Keep false unless you explicitly want to regenerate completed Qwen/search text.
 RESET_EXISTING_QWEN = os.environ.get("RESET_EXISTING_QWEN", "false").lower() == "true"
 
+# If true, the face worker fails before enqueueing Qwen/Gemma when any visible person still
+# has no people.cover_face_s3_key after the cover-crop step.
+STRICT_PERSON_COVERS = os.environ.get("STRICT_PERSON_COVERS", "true").lower() == "true"
+
 # Compression / AI image settings
 AI_INPUT_MAX_SIDE = int(os.environ.get("AI_INPUT_MAX_SIDE", "1600"))
 AI_INPUT_WEBP_QUALITY = int(os.environ.get("AI_INPUT_WEBP_QUALITY", "88"))
@@ -2299,30 +2303,61 @@ def rebuild_photo_people_base_safe(
     return result
 
 def crop_and_upload_missing_person_covers(album_ctx: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Backfill person cover crops.
+
+    This is intentionally strict:
+    - looks for NULL or empty people.cover_face_s3_key
+    - only uses visible people
+    - picks the best labeled face that has a valid ai_input_s3_key
+    - uploads to albums/<album_slug>/faces/<person_id>/cover.jpg
+    - verifies the DB again after upload
+
+    If remaining_missing_covers > 0, process_album_events will fail the job when
+    STRICT_PERSON_COVERS=true so Qwen/Gemma is not enqueued with broken people covers.
+    """
+    started = time.time()
     album_id = album_ctx["album_id"]
     album_slug = album_ctx["album_slug"]
 
     people = db_all("""
-        SELECT pe.id AS person_id,
-               pe.person_number,
-               f.id AS face_id,
-               f.photo_id,
-               f.bbox_x1,
-               f.bbox_y1,
-               f.bbox_x2,
-               f.bbox_y2,
-               p.ai_input_s3_key
+        SELECT
+            pe.id AS person_id,
+            pe.person_number,
+            f.id AS face_id,
+            f.photo_id,
+            f.bbox_x1,
+            f.bbox_y1,
+            f.bbox_x2,
+            f.bbox_y2,
+            p.ai_input_s3_key
         FROM people pe
         JOIN LATERAL (
-            SELECT *
+            SELECT f.*
             FROM faces f
+            JOIN photos p2 ON p2.id = f.photo_id
             WHERE f.person_id = pe.id
-            ORDER BY f.face_quality_score DESC NULLS LAST
+              AND f.bbox_x1 IS NOT NULL
+              AND f.bbox_y1 IS NOT NULL
+              AND f.bbox_x2 IS NOT NULL
+              AND f.bbox_y2 IS NOT NULL
+              AND p2.ai_input_s3_key IS NOT NULL
+              AND p2.ai_input_s3_key <> ''
+              AND COALESCE(p2.is_deleted, false) = false
+            ORDER BY
+              f.face_quality_score DESC NULLS LAST,
+              f.detection_confidence DESC NULLS LAST,
+              f.created_at
             LIMIT 1
         ) f ON true
         JOIN photos p ON p.id = f.photo_id
         WHERE pe.album_id = %s::uuid
-          AND pe.cover_face_s3_key IS NULL;
+          AND COALESCE(pe.is_hidden, false) = false
+          AND (
+              pe.cover_face_s3_key IS NULL
+              OR pe.cover_face_s3_key = ''
+          )
+        ORDER BY pe.person_number;
     """, (album_id,))
 
     ok = 0
@@ -2331,22 +2366,50 @@ def crop_and_upload_missing_person_covers(album_ctx: Dict[str, Any]) -> Dict[str
 
     for r in people:
         pid = str(r["person_id"])
+        tmpdir = LOCAL_WORK / "covers" / pid
+
         try:
-            tmpdir = LOCAL_WORK / "covers" / pid
             tmpdir.mkdir(parents=True, exist_ok=True)
 
+            ai_key = r.get("ai_input_s3_key")
+            if not ai_key:
+                raise RuntimeError("missing ai_input_s3_key for selected cover face")
+
             img_local = tmpdir / "ai.webp"
-            download_file(r["ai_input_s3_key"], img_local)
+            download_file(ai_key, img_local)
 
-            img = Image.open(img_local).convert("RGB")
+            img = Image.open(img_local)
+            img.load()
+            img = ImageOps.exif_transpose(img).convert("RGB")
 
-            pad = 30
-            x1 = max(0, int(r["bbox_x1"]) - pad)
-            y1 = max(0, int(r["bbox_y1"]) - pad)
-            x2 = min(img.width, int(r["bbox_x2"]) + pad)
-            y2 = min(img.height, int(r["bbox_y2"]) + pad)
+            x1 = int(r["bbox_x1"])
+            y1 = int(r["bbox_y1"])
+            x2 = int(r["bbox_x2"])
+            y2 = int(r["bbox_y2"])
 
-            crop = img.crop((x1, y1, x2, y2))
+            if x2 <= x1 or y2 <= y1:
+                raise RuntimeError(
+                    f"invalid face bbox for cover crop: {(x1, y1, x2, y2)}"
+                )
+
+            face_side = max(x2 - x1, y2 - y1)
+            pad = max(30, int(face_side * 0.35))
+
+            crop_x1 = max(0, x1 - pad)
+            crop_y1 = max(0, y1 - pad)
+            crop_x2 = min(img.width, x2 + pad)
+            crop_y2 = min(img.height, y2 + pad)
+
+            if crop_x2 <= crop_x1 or crop_y2 <= crop_y1:
+                raise RuntimeError(
+                    f"invalid padded crop: {(crop_x1, crop_y1, crop_x2, crop_y2)} "
+                    f"image_size={(img.width, img.height)}"
+                )
+
+            crop = img.crop((crop_x1, crop_y1, crop_x2, crop_y2))
+            if crop.width < 2 or crop.height < 2:
+                raise RuntimeError(f"cover crop too small: {(crop.width, crop.height)}")
+
             crop = ImageOps.fit(crop, (256, 256), method=Image.Resampling.LANCZOS)
 
             out = tmpdir / "cover.jpg"
@@ -2357,18 +2420,64 @@ def crop_and_upload_missing_person_covers(album_ctx: Dict[str, Any]) -> Dict[str
 
             execute_sql("""
                 UPDATE people
-                SET cover_face_s3_key=%s,
-                    updated_at=now()
-                WHERE id=%s::uuid;
+                SET cover_face_s3_key = %s,
+                    updated_at = now()
+                WHERE id = %s::uuid;
             """, (key, pid))
 
             ok += 1
 
         except Exception as e:
             failed += 1
-            errors.append({"person_id": pid, "error": repr(e)})
+            err = {
+                "person_id": pid,
+                "person_number": r.get("person_number"),
+                "photo_id": str(r.get("photo_id")) if r.get("photo_id") else None,
+                "face_id": str(r.get("face_id")) if r.get("face_id") else None,
+                "error": repr(e),
+            }
+            errors.append(err)
+            print("Cover crop failed:", err, flush=True)
 
-    result = {"missing_covers": len(people), "ok": ok, "failed": failed, "errors": errors[:25]}
+        finally:
+            try:
+                shutil.rmtree(tmpdir, ignore_errors=True)
+            except Exception:
+                pass
+
+    remaining = db_one("""
+        SELECT COUNT(*) AS remaining_missing_covers
+        FROM people
+        WHERE album_id = %s::uuid
+          AND COALESCE(is_hidden, false) = false
+          AND (
+              cover_face_s3_key IS NULL
+              OR cover_face_s3_key = ''
+          );
+    """, (album_id,))
+
+    with_cover = db_one("""
+        SELECT COUNT(*) AS with_covers
+        FROM people
+        WHERE album_id = %s::uuid
+          AND COALESCE(is_hidden, false) = false
+          AND cover_face_s3_key IS NOT NULL
+          AND cover_face_s3_key <> '';
+    """, (album_id,))
+
+    remaining_missing = int(remaining["remaining_missing_covers"] or 0) if remaining else 0
+    with_covers_count = int(with_cover["with_covers"] or 0) if with_cover else 0
+
+    result = {
+        "missing_covers_at_start": len(people),
+        "ok": ok,
+        "failed": failed,
+        "with_covers": with_covers_count,
+        "remaining_missing_covers": remaining_missing,
+        "verified_no_missing_covers": remaining_missing == 0,
+        "errors": errors[:25],
+        "seconds": round(time.time() - started, 2),
+    }
     print("Cover crop result:", result, flush=True)
     return result
 
@@ -3396,7 +3505,14 @@ def final_verify(album_ctx: Dict[str, Any], events: List[Dict[str, Any]]) -> Dic
     people_summary = db_one("""
         SELECT
             COUNT(*) AS people_count,
-            COUNT(*) FILTER (WHERE cover_face_s3_key IS NULL) AS missing_covers
+            COUNT(*) FILTER (
+                WHERE cover_face_s3_key IS NOT NULL
+                  AND cover_face_s3_key <> ''
+            ) AS with_covers,
+            COUNT(*) FILTER (
+                WHERE cover_face_s3_key IS NULL
+                   OR cover_face_s3_key = ''
+            ) AS missing_covers
         FROM people
         WHERE album_id = %s::uuid
           AND COALESCE(is_hidden, false) = false;
@@ -4412,6 +4528,8 @@ def normalize_steps(payload: Dict[str, Any]) -> Dict[str, bool]:
       Otherwise the image-text worker sees no labeled people and returns rows=0.
     - Person cover generation is separate from person creation.
       It writes people.cover_face_s3_key.
+    - If enqueue_qwen=true, this worker will force a cover backfill before enqueue
+      even when crop_person_covers was accidentally omitted from the payload.
     """
 
     full_mode = bool(payload.get("full_mode", False) or payload.get("face_full_mode", False))
@@ -4440,6 +4558,12 @@ def normalize_steps(payload: Dict[str, Any]) -> Dict[str, bool]:
 
     # Never allow destructive people rebuild from this safe path.
     merged["rebuild_people"] = False
+
+    # Safety rule:
+    # If this face worker is about to enqueue Qwen/Gemma, covers must be backfilled first.
+    # This prevents the exact issue where people exist but cover_face_s3_key stays empty.
+    if bool(merged.get("enqueue_qwen", False)):
+        merged["crop_person_covers"] = True
 
     return {k: bool(v) for k, v in merged.items()}
 
@@ -4518,7 +4642,7 @@ def process_album_events(job_id: str, payload: Dict[str, Any]) -> Dict[str, Any]
         results["steps"]["face_index"] = face_index_events(album_ctx, db_events)
 
     # 4. IMPORTANT: reconcile people before Qwen/Gemma enqueue.
-    # Do not crop covers inside this call; we run cover crop as its own explicit step below
+    # Do not crop covers inside this call; cover crop is its own explicit step below
     # so existing albums can be backfilled without rerunning reconciliation.
     if steps.get("safe_people_reconcile", False):
         update_job_status(
@@ -4543,7 +4667,17 @@ def process_album_events(job_id: str, payload: Dict[str, Any]) -> Dict[str, Any]
             "crop_person_covers",
             "Cropping and uploading missing person cover faces",
         )
-        results["steps"]["crop_person_covers"] = crop_and_upload_missing_person_covers(album_ctx)
+        cover_result = crop_and_upload_missing_person_covers(album_ctx)
+        results["steps"]["crop_person_covers"] = cover_result
+
+        remaining_missing = int(cover_result.get("remaining_missing_covers") or 0)
+        if STRICT_PERSON_COVERS and remaining_missing > 0:
+            raise RuntimeError(
+                "Person cover backfill did not complete. "
+                f"remaining_missing_covers={remaining_missing}. "
+                f"failed={cover_result.get('failed')}. "
+                f"errors={cover_result.get('errors', [])[:5]}"
+            )
 
     # Optional duplicate candidate generation, still off by default.
     if bool(payload.get("build_duplicate_candidates", False)):
@@ -4555,13 +4689,13 @@ def process_album_events(job_id: str, payload: Dict[str, Any]) -> Dict[str, Any]
         )
         results["steps"]["build_duplicate_candidates"] = build_duplicate_candidates(album_ctx)
 
-    # 6. Only now enqueue Qwen/Gemma, after faces have person_id and covers can exist.
+    # 6. Only now enqueue Qwen/Gemma, after faces have person_id and covers exist.
     if steps.get("enqueue_qwen", False):
         update_job_status(
             job_id,
             "running",
             "enqueue_qwen",
-            "Enqueuing image-text endpoint after people reconcile",
+            "Enqueuing image-text endpoint after people reconcile and cover backfill",
         )
         results["steps"]["enqueue_qwen"] = enqueue_qwen_after_face(normalized_payload)
 
@@ -4576,6 +4710,7 @@ def process_album_events(job_id: str, payload: Dict[str, Any]) -> Dict[str, Any]
 
     update_job_status(job_id, "completed", "face_worker", "Face worker completed")
     return results
+
 
 # ============================================================
 # RUNPOD HANDLER
