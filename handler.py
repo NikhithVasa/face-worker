@@ -4396,38 +4396,52 @@ def forward_culling_mode_to_qwen(payload: Dict[str, Any]) -> Dict[str, Any]:
 # ============================================================
 
 def normalize_steps(payload: Dict[str, Any]) -> Dict[str, bool]:
-    if payload.get("full_mode", False) or payload.get("face_full_mode", False):
-        return {
-            "ingest": True,
-            "compress": True,
-            "face_index": True,
-            "safe_people_reconcile": True,
-            "rebuild_people": False,
-            "qwen": False,
-            "embeddings": False,
-            "culling": False,
-            "cleanup_temp": False,
-            "enqueue_qwen": True,
-        }
+    """
+    Face worker steps.
+
+    Correct order:
+    1. ingest
+    2. compress
+    3. face_index
+    4. safe_people_reconcile
+    5. crop_person_covers
+    6. enqueue_qwen / Gemma
+
+    Important:
+    - Qwen/Gemma must be enqueued after people are reconciled.
+      Otherwise the image-text worker sees no labeled people and returns rows=0.
+    - Person cover generation is separate from person creation.
+      It writes people.cover_face_s3_key.
+    """
+
+    full_mode = bool(payload.get("full_mode", False) or payload.get("face_full_mode", False))
 
     default_steps = {
         "ingest": True,
-        "compress": False,
-        "face_index": False,
-        "safe_people_reconcile": False,
+        "compress": bool(full_mode),
+        "face_index": bool(full_mode),
+        "safe_people_reconcile": bool(full_mode),
+        "crop_person_covers": bool(full_mode),
+        "enqueue_qwen": bool(full_mode),
+
+        # Keep old/other pipeline steps present but off in face-worker.
         "rebuild_people": False,
         "qwen": False,
         "embeddings": False,
         "culling": False,
         "cleanup_temp": False,
-        "enqueue_qwen": False,
     }
 
     supplied = payload.get("steps")
-    if supplied:
-        return {**default_steps, **supplied}
+    if isinstance(supplied, dict):
+        merged = {**default_steps, **supplied}
+    else:
+        merged = default_steps
 
-    return default_steps
+    # Never allow destructive people rebuild from this safe path.
+    merged["rebuild_people"] = False
+
+    return {k: bool(v) for k, v in merged.items()}
 
 
 def process_album_events(job_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -4456,7 +4470,7 @@ def process_album_events(job_id: str, payload: Dict[str, Any]) -> Dict[str, Any]
     update_job_status(job_id, "running", "upsert_events", "Creating/restoring event rows")
     db_events = upsert_events(album_ctx, events)
 
-    # Use normalized event prefixes for Qwen too, not the raw broad prefix from the request.
+    # Use normalized event prefixes for Qwen/Gemma too, not the raw broad prefix from the request.
     normalized_payload = {**payload, "events": db_events}
 
     results: Dict[str, Any] = {
@@ -4465,40 +4479,100 @@ def process_album_events(job_id: str, payload: Dict[str, Any]) -> Dict[str, Any]
         "steps": {},
     }
 
+    # 1. Ingest originals from S3 into DB photo rows.
     if steps.get("ingest", True):
-        update_job_status(job_id, "running", "ingest", "Scanning S3 originals and ingesting photos")
+        update_job_status(
+            job_id,
+            "running",
+            "ingest",
+            "Scanning S3 originals and ingesting photos",
+        )
         results["steps"]["ingest"] = scan_and_ingest_originals(album_ctx, db_events)
 
-        update_job_status(job_id, "running", "s3_validation", "Validating S3 source objects")
+        update_job_status(
+            job_id,
+            "running",
+            "s3_validation",
+            "Validating S3 source objects",
+        )
         results["steps"]["s3_validation"] = validate_s3_sources(album_ctx, db_events)
 
+    # 2. Generate AI input images.
     if steps.get("compress", False):
-        update_job_status(job_id, "running", "compress", "Generating AI input images")
+        update_job_status(
+            job_id,
+            "running",
+            "compress",
+            "Generating AI input images",
+        )
         results["steps"]["compress"] = compress_events(album_ctx, db_events)
 
+    # 3. Detect faces and write face embeddings.
     if steps.get("face_index", False):
-        update_job_status(job_id, "running", "face_index", "Running InsightFace detection/recognition on GPU")
+        update_job_status(
+            job_id,
+            "running",
+            "face_index",
+            "Running InsightFace detection/recognition on GPU",
+        )
         results["steps"]["face_index"] = face_index_events(album_ctx, db_events)
 
-    # Important: enqueue Qwen before people reconcile, so captions/search are not blocked
-    # by slow album-level person work.
-    if steps.get("enqueue_qwen", False):
-        update_job_status(job_id, "running", "enqueue_qwen", "Enqueuing Qwen endpoint before people reconcile")
-        results["steps"]["enqueue_qwen"] = enqueue_qwen_after_face(normalized_payload)
-
+    # 4. IMPORTANT: reconcile people before Qwen/Gemma enqueue.
+    # Do not crop covers inside this call; we run cover crop as its own explicit step below
+    # so existing albums can be backfilled without rerunning reconciliation.
     if steps.get("safe_people_reconcile", False):
         update_job_status(
             job_id,
             "running",
             "safe_people_reconcile",
-            "Assigning new event faces without deleting existing people/names",
+            "Assigning faces to people before image-text metadata",
         )
         results["steps"]["safe_people_reconcile"] = safe_add_new_people_without_touching_existing_names(
             album_ctx,
             db_events,
-            build_candidates=bool(payload.get("build_duplicate_candidates", False)),
-            crop_covers=bool(payload.get("crop_person_covers", False)),
+            build_candidates=False,
+            crop_covers=False,
         )
+
+    # 5. Generate/backfill people cover images.
+    # This writes people.cover_face_s3_key.
+    if steps.get("crop_person_covers", False):
+        update_job_status(
+            job_id,
+            "running",
+            "crop_person_covers",
+            "Cropping and uploading missing person cover faces",
+        )
+        results["steps"]["crop_person_covers"] = crop_and_upload_missing_person_covers(album_ctx)
+
+    # Optional duplicate candidate generation, still off by default.
+    if bool(payload.get("build_duplicate_candidates", False)):
+        update_job_status(
+            job_id,
+            "running",
+            "build_duplicate_candidates",
+            "Building possible duplicate people candidates",
+        )
+        results["steps"]["build_duplicate_candidates"] = build_duplicate_candidates(album_ctx)
+
+    # 6. Only now enqueue Qwen/Gemma, after faces have person_id and covers can exist.
+    if steps.get("enqueue_qwen", False):
+        update_job_status(
+            job_id,
+            "running",
+            "enqueue_qwen",
+            "Enqueuing image-text endpoint after people reconcile",
+        )
+        results["steps"]["enqueue_qwen"] = enqueue_qwen_after_face(normalized_payload)
+
+    if steps.get("cleanup_temp", False):
+        update_job_status(
+            job_id,
+            "running",
+            "cleanup_temp",
+            "Deleting temporary AI folders",
+        )
+        results["steps"]["cleanup_temp"] = cleanup_temp_s3(album_ctx, db_events)
 
     update_job_status(job_id, "completed", "face_worker", "Face worker completed")
     return results
