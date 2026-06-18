@@ -10,6 +10,9 @@ import shutil
 import traceback
 import tempfile
 import subprocess
+import platform
+import socket
+from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -24,6 +27,276 @@ from PIL import Image, ImageDraw, ImageOps
 from tqdm import tqdm
 
 import runpod
+
+# ============================================================
+# STARTUP CONFIG / STAGE DEBUGGING
+# ============================================================
+
+BOOT_TS = time.time()
+
+SENSITIVE_ENV_KEY_PARTS = (
+    "KEY",
+    "TOKEN",
+    "SECRET",
+    "PASSWORD",
+    "AUTH",
+    "CREDENTIAL",
+    "COOKIE",
+    "PRIVATE",
+)
+
+def _redact_config_value(key: str, value: Any) -> Any:
+    if value is None:
+        return None
+
+    s = str(value)
+
+    if any(part in key.upper() for part in SENSITIVE_ENV_KEY_PARTS):
+        if len(s) <= 8:
+            return "***REDACTED***"
+        return f"***REDACTED*** len={len(s)} suffix={s[-4:]}"
+
+    if len(s) > 500:
+        return s[:500] + f"...[truncated len={len(s)}]"
+
+    return s
+
+
+def _safe_json(obj: Any) -> str:
+    try:
+        return json.dumps(obj, indent=2, default=str, sort_keys=True)
+    except Exception as e:
+        return json.dumps(
+            {
+                "json_error": repr(e),
+                "raw_type": str(type(obj)),
+                "raw_preview": str(obj)[:2000],
+            },
+            indent=2,
+            sort_keys=True,
+        )
+
+
+def print_startup_config_snapshot(job: Optional[Dict[str, Any]] = None, label: str = "FACE_WORKER") -> None:
+    """
+    Prints a sanitized startup snapshot before any long stage runs.
+
+    This is intentionally safe for RunPod logs:
+    - secrets are redacted
+    - raw job input is printed so we can confirm steps
+    - selected env vars are printed so we can confirm template/runtime config
+    """
+    try:
+        now = datetime.now(timezone.utc).isoformat()
+
+        selected_env_keys = [
+            # RunPod/runtime
+            "RUNPOD_POD_ID",
+            "RUNPOD_POD_HOSTNAME",
+            "RUNPOD_PUBLIC_IP",
+            "RUNPOD_ENDPOINT_ID",
+            "RUNPOD_WORKER_ID",
+            "RUNPOD_CPU_COUNT",
+            "RUNPOD_GPU_COUNT",
+            "RUNPOD_GPU_MEMORY_MB",
+            "RUNPOD_MEMORY_MB",
+
+            # app config
+            "S3_BUCKET",
+            "AWS_DEFAULT_REGION",
+            "RDS_HOST",
+            "RDS_PORT",
+            "RDS_DB",
+            "RDS_USER",
+            "LOCAL_WORK",
+
+            # worker behavior
+            "DB_POOL_MIN_CONN",
+            "DB_POOL_MAX_CONN",
+            "DB_CONNECT_RETRIES",
+            "DB_CONNECT_TIMEOUT",
+            "DB_KEEPALIVES_IDLE",
+            "DB_KEEPALIVES_INTERVAL",
+            "DB_KEEPALIVES_COUNT",
+            "COMPRESS_MAX_WORKERS",
+            "COMPRESS_LOG_EVERY",
+            "COMPRESS_REUSE_EXISTING_AI_INPUT",
+            "DELETE_TEMP_AI_INPUT",
+            "DELETE_TEMP_ANNOTATED",
+            "RESET_EXISTING_QWEN",
+            "STRICT_PERSON_COVERS",
+            "STRICT_FACE_GPU",
+
+            # face/model config
+            "FACE_DET_SIZE",
+            "FACE_DET_CONF_THRESHOLD",
+            "FACE_CLUSTER_QUALITY_THRESHOLD",
+            "FACE_CLUSTER_MIN_FACE_SIDE",
+            "INSIGHTFACE_ALLOWED_MODULES",
+
+            # downstream image-text endpoint/provider
+            "QWEN_ENDPOINT_ID",
+            "QWEN_RUN_URL",
+            "IMAGE_TEXT_MODEL_PROVIDER",
+            "VISION_MODEL_PROVIDER",
+            "GEMMA_MODEL_ID",
+            "GEMMA_QUANTIZATION",
+            "QWEN_MODEL_ID",
+        ]
+
+        selected_env = {
+            key: _redact_config_value(key, os.environ.get(key))
+            for key in selected_env_keys
+            if key in os.environ
+        }
+
+        runpod_env = {
+            key: _redact_config_value(key, value)
+            for key, value in sorted(os.environ.items())
+            if key.startswith("RUNPOD_")
+        }
+
+        job_id = None
+        job_input = None
+        job_policy = None
+        job_keys = None
+
+        if isinstance(job, dict):
+            job_id = job.get("id") or job.get("job_id")
+            job_input = job.get("input")
+            job_policy = job.get("policy") or job.get("jobPolicy")
+            job_keys = sorted(list(job.keys()))
+
+        snapshot = {
+            "label": label,
+            "utc": now,
+            "boot_age_seconds": round(time.time() - BOOT_TS, 2),
+            "hostname": socket.gethostname(),
+            "python": platform.python_version(),
+            "platform": platform.platform(),
+            "pid": os.getpid(),
+            "job_id": job_id,
+            "job_keys": job_keys,
+            "job_policy": job_policy,
+            "selected_env": selected_env,
+            "runpod_env": runpod_env,
+        }
+
+        print("========== CONFIG SNAPSHOT START ==========", flush=True)
+        print(_safe_json(snapshot), flush=True)
+
+        if job_input is not None:
+            print("========== RUNPOD JOB INPUT START ==========", flush=True)
+            print(_safe_json(job_input), flush=True)
+            print("========== RUNPOD JOB INPUT END ==========", flush=True)
+        else:
+            print("========== RAW RUNPOD JOB START ==========", flush=True)
+            print(_safe_json(job), flush=True)
+            print("========== RAW RUNPOD JOB END ==========", flush=True)
+
+        print("========== CONFIG SNAPSHOT END ==========", flush=True)
+
+    except Exception as e:
+        print("CONFIG SNAPSHOT FAILED:", repr(e), flush=True)
+        print(traceback.format_exc(), flush=True)
+
+
+def stage_timer(stage_name: str):
+    class _StageTimer:
+        def __enter__(self):
+            self.t0 = time.time()
+            print(
+                f"[STAGE_START] {stage_name} "
+                f"utc={datetime.now(timezone.utc).isoformat()} "
+                f"boot_age_seconds={round(time.time() - BOOT_TS, 2)}",
+                flush=True,
+            )
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            elapsed = round(time.time() - self.t0, 2)
+            if exc is not None:
+                print(
+                    f"[STAGE_FAIL] {stage_name} seconds={elapsed} error={repr(exc)}",
+                    flush=True,
+                )
+                print(traceback.format_exc(), flush=True)
+            else:
+                print(
+                    f"[STAGE_DONE] {stage_name} seconds={elapsed}",
+                    flush=True,
+                )
+
+            # Returning False propagates exceptions normally.
+            return False
+
+    return _StageTimer()
+
+
+def print_db_progress_snapshot(album_slug: str, stage_name: str) -> None:
+    """
+    Lightweight DB progress snapshot after important stages.
+    Best-effort only; it must never crash the main job.
+    """
+    try:
+        row = db_one("""
+            SELECT
+              COUNT(*) AS total_photos,
+              COUNT(*) FILTER (WHERE p.compression_status='completed') AS compression_completed,
+              COUNT(*) FILTER (WHERE p.compression_status='pending') AS compression_pending,
+              COUNT(*) FILTER (WHERE p.compression_status='failed') AS compression_failed,
+              COUNT(*) FILTER (WHERE p.face_index_status='completed') AS face_completed,
+              COUNT(*) FILTER (WHERE p.face_index_status='pending') AS face_pending,
+              COUNT(*) FILTER (WHERE p.face_index_status='failed') AS face_failed,
+              COUNT(*) FILTER (WHERE p.qwen_status='completed') AS qwen_completed,
+              COUNT(*) FILTER (WHERE p.qwen_status='pending') AS qwen_pending,
+              COUNT(*) FILTER (WHERE p.qwen_status='failed') AS qwen_failed,
+              MAX(p.updated_at) AS last_photo_update
+            FROM photos p
+            JOIN albums a ON a.id = p.album_id
+            WHERE a.slug = %s
+              AND COALESCE(p.is_deleted, false)=false;
+        """, (album_slug,))
+
+        faces = db_one("""
+            SELECT
+              COUNT(*) AS total_faces,
+              COUNT(*) FILTER (WHERE f.person_id IS NOT NULL) AS labeled_faces
+            FROM faces f
+            JOIN albums a ON a.id = f.album_id
+            WHERE a.slug = %s;
+        """, (album_slug,))
+
+        people = db_one("""
+            SELECT
+              COUNT(*) AS total_people,
+              COUNT(*) FILTER (
+                WHERE p.cover_face_s3_key IS NOT NULL
+                  AND p.cover_face_s3_key <> ''
+              ) AS people_with_covers,
+              COUNT(*) FILTER (
+                WHERE p.cover_face_s3_key IS NULL
+                   OR p.cover_face_s3_key = ''
+              ) AS people_missing_covers
+            FROM people p
+            JOIN albums a ON a.id = p.album_id
+            WHERE a.slug = %s
+              AND COALESCE(p.is_hidden, false)=false;
+        """, (album_slug,))
+
+        print(
+            "[DB_PROGRESS] " + _safe_json({
+                "stage": stage_name,
+                "album_slug": album_slug,
+                "photos": dict(row or {}),
+                "faces": dict(faces or {}),
+                "people": dict(people or {}),
+            }),
+            flush=True,
+        )
+
+    except Exception as e:
+        print(f"[DB_PROGRESS_FAILED] stage={stage_name} error={repr(e)}", flush=True)
 
 
 # ============================================================
@@ -4581,6 +4854,26 @@ def process_album_events(job_id: str, payload: Dict[str, Any]) -> Dict[str, Any]
 
     steps = normalize_steps(payload)
 
+    print(
+        "[PIPELINE_CONFIG] " + _safe_json({
+            "job_id": job_id,
+            "album_slug": album_slug,
+            "album_name": album_name,
+            "event_count": len(events),
+            "mode": payload.get("mode"),
+            "full_mode": payload.get("full_mode"),
+            "steps": steps,
+            "compress_max_workers": COMPRESS_MAX_WORKERS,
+            "compress_reuse_existing_ai_input": COMPRESS_REUSE_EXISTING_AI_INPUT,
+            "db_pool_max_conn": DB_POOL_MAX_CONN,
+            "strict_person_covers": STRICT_PERSON_COVERS,
+            "strict_face_gpu": STRICT_FACE_GPU,
+            "qwen_endpoint_id_set": bool(QWEN_ENDPOINT_ID),
+            "qwen_run_url_set": bool(QWEN_RUN_URL),
+        }),
+        flush=True,
+    )
+
     if steps.get("rebuild_people", False):
         raise RuntimeError(
             "Blocked: destructive rebuild_people is not allowed. "
@@ -4589,10 +4882,12 @@ def process_album_events(job_id: str, payload: Dict[str, Any]) -> Dict[str, Any]
         )
 
     update_job_status(job_id, "running", "restore_album", "Restoring album context")
-    album_ctx = restore_album_context(album_slug, album_name=album_name)
+    with stage_timer("restore_album"):
+        album_ctx = restore_album_context(album_slug, album_name=album_name)
 
     update_job_status(job_id, "running", "upsert_events", "Creating/restoring event rows")
-    db_events = upsert_events(album_ctx, events)
+    with stage_timer("upsert_events"):
+        db_events = upsert_events(album_ctx, events)
 
     # Use normalized event prefixes for Qwen/Gemma too, not the raw broad prefix from the request.
     normalized_payload = {**payload, "events": db_events}
@@ -4603,6 +4898,8 @@ def process_album_events(job_id: str, payload: Dict[str, Any]) -> Dict[str, Any]
         "steps": {},
     }
 
+    print_db_progress_snapshot(album_slug, "before_steps")
+
     # 1. Ingest originals from S3 into DB photo rows.
     if steps.get("ingest", True):
         update_job_status(
@@ -4611,7 +4908,9 @@ def process_album_events(job_id: str, payload: Dict[str, Any]) -> Dict[str, Any]
             "ingest",
             "Scanning S3 originals and ingesting photos",
         )
-        results["steps"]["ingest"] = scan_and_ingest_originals(album_ctx, db_events)
+        with stage_timer("ingest"):
+            results["steps"]["ingest"] = scan_and_ingest_originals(album_ctx, db_events)
+        print_db_progress_snapshot(album_slug, "after_ingest")
 
         update_job_status(
             job_id,
@@ -4619,7 +4918,11 @@ def process_album_events(job_id: str, payload: Dict[str, Any]) -> Dict[str, Any]
             "s3_validation",
             "Validating S3 source objects",
         )
-        results["steps"]["s3_validation"] = validate_s3_sources(album_ctx, db_events)
+        with stage_timer("s3_validation"):
+            results["steps"]["s3_validation"] = validate_s3_sources(album_ctx, db_events)
+        print_db_progress_snapshot(album_slug, "after_s3_validation")
+    else:
+        print("[STAGE_SKIP] ingest=false; skipping S3 scan and S3 validation", flush=True)
 
     # 2. Generate AI input images.
     if steps.get("compress", False):
@@ -4629,7 +4932,11 @@ def process_album_events(job_id: str, payload: Dict[str, Any]) -> Dict[str, Any]
             "compress",
             "Generating AI input images",
         )
-        results["steps"]["compress"] = compress_events(album_ctx, db_events)
+        with stage_timer("compress"):
+            results["steps"]["compress"] = compress_events(album_ctx, db_events)
+        print_db_progress_snapshot(album_slug, "after_compress")
+    else:
+        print("[STAGE_SKIP] compress=false", flush=True)
 
     # 3. Detect faces and write face embeddings.
     if steps.get("face_index", False):
@@ -4639,7 +4946,11 @@ def process_album_events(job_id: str, payload: Dict[str, Any]) -> Dict[str, Any]
             "face_index",
             "Running InsightFace detection/recognition on GPU",
         )
-        results["steps"]["face_index"] = face_index_events(album_ctx, db_events)
+        with stage_timer("face_index"):
+            results["steps"]["face_index"] = face_index_events(album_ctx, db_events)
+        print_db_progress_snapshot(album_slug, "after_face_index")
+    else:
+        print("[STAGE_SKIP] face_index=false", flush=True)
 
     # 4. IMPORTANT: reconcile people before Qwen/Gemma enqueue.
     # Do not crop covers inside this call; cover crop is its own explicit step below
@@ -4651,12 +4962,16 @@ def process_album_events(job_id: str, payload: Dict[str, Any]) -> Dict[str, Any]
             "safe_people_reconcile",
             "Assigning faces to people before image-text metadata",
         )
-        results["steps"]["safe_people_reconcile"] = safe_add_new_people_without_touching_existing_names(
-            album_ctx,
-            db_events,
-            build_candidates=False,
-            crop_covers=False,
-        )
+        with stage_timer("safe_people_reconcile"):
+            results["steps"]["safe_people_reconcile"] = safe_add_new_people_without_touching_existing_names(
+                album_ctx,
+                db_events,
+                build_candidates=False,
+                crop_covers=False,
+            )
+        print_db_progress_snapshot(album_slug, "after_safe_people_reconcile")
+    else:
+        print("[STAGE_SKIP] safe_people_reconcile=false", flush=True)
 
     # 5. Generate/backfill people cover images.
     # This writes people.cover_face_s3_key.
@@ -4667,8 +4982,10 @@ def process_album_events(job_id: str, payload: Dict[str, Any]) -> Dict[str, Any]
             "crop_person_covers",
             "Cropping and uploading missing person cover faces",
         )
-        cover_result = crop_and_upload_missing_person_covers(album_ctx)
+        with stage_timer("crop_person_covers"):
+            cover_result = crop_and_upload_missing_person_covers(album_ctx)
         results["steps"]["crop_person_covers"] = cover_result
+        print_db_progress_snapshot(album_slug, "after_crop_person_covers")
 
         remaining_missing = int(cover_result.get("remaining_missing_covers") or 0)
         if STRICT_PERSON_COVERS and remaining_missing > 0:
@@ -4678,6 +4995,8 @@ def process_album_events(job_id: str, payload: Dict[str, Any]) -> Dict[str, Any]
                 f"failed={cover_result.get('failed')}. "
                 f"errors={cover_result.get('errors', [])[:5]}"
             )
+    else:
+        print("[STAGE_SKIP] crop_person_covers=false", flush=True)
 
     # Optional duplicate candidate generation, still off by default.
     if bool(payload.get("build_duplicate_candidates", False)):
@@ -4687,7 +5006,9 @@ def process_album_events(job_id: str, payload: Dict[str, Any]) -> Dict[str, Any]
             "build_duplicate_candidates",
             "Building possible duplicate people candidates",
         )
-        results["steps"]["build_duplicate_candidates"] = build_duplicate_candidates(album_ctx)
+        with stage_timer("build_duplicate_candidates"):
+            results["steps"]["build_duplicate_candidates"] = build_duplicate_candidates(album_ctx)
+        print_db_progress_snapshot(album_slug, "after_build_duplicate_candidates")
 
     # 6. Only now enqueue Qwen/Gemma, after faces have person_id and covers exist.
     if steps.get("enqueue_qwen", False):
@@ -4697,7 +5018,11 @@ def process_album_events(job_id: str, payload: Dict[str, Any]) -> Dict[str, Any]
             "enqueue_qwen",
             "Enqueuing image-text endpoint after people reconcile and cover backfill",
         )
-        results["steps"]["enqueue_qwen"] = enqueue_qwen_after_face(normalized_payload)
+        with stage_timer("enqueue_qwen"):
+            results["steps"]["enqueue_qwen"] = enqueue_qwen_after_face(normalized_payload)
+        print_db_progress_snapshot(album_slug, "after_enqueue_qwen")
+    else:
+        print("[STAGE_SKIP] enqueue_qwen=false", flush=True)
 
     if steps.get("cleanup_temp", False):
         update_job_status(
@@ -4706,11 +5031,12 @@ def process_album_events(job_id: str, payload: Dict[str, Any]) -> Dict[str, Any]
             "cleanup_temp",
             "Deleting temporary AI folders",
         )
-        results["steps"]["cleanup_temp"] = cleanup_temp_s3(album_ctx, db_events)
+        with stage_timer("cleanup_temp"):
+            results["steps"]["cleanup_temp"] = cleanup_temp_s3(album_ctx, db_events)
 
+    print_db_progress_snapshot(album_slug, "final")
     update_job_status(job_id, "completed", "face_worker", "Face worker completed")
     return results
-
 
 # ============================================================
 # RUNPOD HANDLER
@@ -4719,13 +5045,18 @@ def process_album_events(job_id: str, payload: Dict[str, Any]) -> Dict[str, Any]
 def handler(event):
     started = time.time()
 
-    job_id = event.get("id", "local_test")
-    payload = event.get("input", {})
+    print_startup_config_snapshot(event, label="FACE_WORKER")
+
+    job_id = event.get("id", "local_test") if isinstance(event, dict) else "local_test"
+    payload = event.get("input", {}) if isinstance(event, dict) else {}
 
     try:
         print("Face Worker Start", flush=True)
         print("job_id:", job_id, flush=True)
-        print("payload:", payload, flush=True)
+        print("payload steps:", _safe_json((payload or {}).get("steps")), flush=True)
+        print("payload album_slug:", (payload or {}).get("album_slug"), flush=True)
+        print("payload mode:", (payload or {}).get("mode"), flush=True)
+        print("payload full_mode:", (payload or {}).get("full_mode"), flush=True)
 
         if payload.get("debug_gpu"):
             import torch
