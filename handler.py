@@ -121,6 +121,12 @@ def print_startup_config_snapshot(job: Optional[Dict[str, Any]] = None, label: s
             "COMPRESS_MAX_WORKERS",
             "COMPRESS_LOG_EVERY",
             "COMPRESS_REUSE_EXISTING_AI_INPUT",
+            "S3_VALIDATION_MODE",
+            "FACE_INDEX_LOG_EVERY",
+            "COVER_MAX_WORKERS",
+            "COVER_LOG_EVERY",
+            "CREATE_LOW_QUALITY_SINGLETON_PEOPLE",
+            "LOW_QUALITY_CLUSTER_MIN_FACES",
             "DELETE_TEMP_AI_INPUT",
             "DELETE_TEMP_ANNOTATED",
             "RESET_EXISTING_QWEN",
@@ -332,8 +338,28 @@ AI_INPUT_WEBP_QUALITY = int(os.environ.get("AI_INPUT_WEBP_QUALITY", "88"))
 # Compression parallelism.
 # Compression is S3/network + CPU image encode. GPU is not used here.
 # Keep this conservative if your RDS is small; each worker only touches DB at the end.
-COMPRESS_MAX_WORKERS = int(os.environ.get("COMPRESS_MAX_WORKERS", "6"))
+COMPRESS_MAX_WORKERS = int(os.environ.get("COMPRESS_MAX_WORKERS", "4"))
 COMPRESS_LOG_EVERY = int(os.environ.get("COMPRESS_LOG_EVERY", "25"))
+
+# S3 validation mode:
+# - created_only: validate only when ingest created new photo rows, or payload.validate_s3=true
+# - always: validate after every ingest
+# - never: skip validation unless payload.validate_s3=true
+# This keeps ingest intact but avoids repeating 1,000+ HeadObject calls on retries.
+S3_VALIDATION_MODE = os.environ.get("S3_VALIDATION_MODE", "created_only").lower()
+
+# Face index is usually single-worker because InsightFace/GPU sessions are not reliably thread-safe,
+# but progress logging prevents the long silent section.
+FACE_INDEX_LOG_EVERY = int(os.environ.get("FACE_INDEX_LOG_EVERY", "25"))
+
+# Person cover crop is S3 + CPU JPEG work. It is safe to parallelize by source image group.
+COVER_MAX_WORKERS = int(os.environ.get("COVER_MAX_WORKERS", "4"))
+COVER_LOG_EVERY = int(os.environ.get("COVER_LOG_EVERY", "25"))
+
+# Keep blurred/low-quality faces as matches, but do not create thousands of new singleton people
+# from tiny/blurred faces unless explicitly enabled.
+CREATE_LOW_QUALITY_SINGLETON_PEOPLE = os.environ.get("CREATE_LOW_QUALITY_SINGLETON_PEOPLE", "false").lower() == "true"
+LOW_QUALITY_CLUSTER_MIN_FACES = int(os.environ.get("LOW_QUALITY_CLUSTER_MIN_FACES", "2"))
 
 # If true, and ai_input_s3_key already exists in S3, mark compression completed without regenerating.
 # For a true full rerun, keep false. For faster retries, set true.
@@ -343,9 +369,11 @@ COMPRESS_REUSE_EXISTING_AI_INPUT = os.environ.get("COMPRESS_REUSE_EXISTING_AI_IN
 FACE_DET_SIZE = tuple(
     int(x.strip()) for x in os.environ.get("FACE_DET_SIZE", "640,640").split(",")
 )
+# Keep detector threshold permissive so blurred faces can still match existing people.
+# Use the seed thresholds below to control whether low-quality faces create NEW people.
 FACE_DET_CONF_THRESHOLD = float(os.environ.get("FACE_DET_CONF_THRESHOLD", "0.45"))
-FACE_CLUSTER_QUALITY_THRESHOLD = float(os.environ.get("FACE_CLUSTER_QUALITY_THRESHOLD", "0.60"))
-FACE_CLUSTER_MIN_FACE_SIDE = int(os.environ.get("FACE_CLUSTER_MIN_FACE_SIDE", "32"))
+FACE_CLUSTER_QUALITY_THRESHOLD = float(os.environ.get("FACE_CLUSTER_QUALITY_THRESHOLD", "0.62"))
+FACE_CLUSTER_MIN_FACE_SIDE = int(os.environ.get("FACE_CLUSTER_MIN_FACE_SIDE", "48"))
 PEOPLE_MATCH_EXISTING_SIM_THRESHOLD = float(os.environ.get("PEOPLE_MATCH_EXISTING_SIM_THRESHOLD", "0.58"))
 NEW_FACE_CLUSTER_SIM_THRESHOLD = float(os.environ.get("NEW_FACE_CLUSTER_SIM_THRESHOLD", "0.62"))
 DUPLICATE_CANDIDATE_SIM_THRESHOLD = float(os.environ.get("DUPLICATE_CANDIDATE_SIM_THRESHOLD", "0.55"))
@@ -364,6 +392,8 @@ INSIGHTFACE_ALLOWED_MODULES = [
 QWEN_ENDPOINT_ID = os.environ.get("QWEN_ENDPOINT_ID")
 QWEN_RUN_URL = os.environ.get("QWEN_RUN_URL")
 RUNPOD_API_KEY = os.environ.get("RUNPOD_API_KEY")
+RUNPOD_JOB_POLICY_TIMEOUT_MS = int(os.environ.get("RUNPOD_JOB_POLICY_TIMEOUT_MS", "604800000"))
+RUNPOD_JOB_POLICY_TTL_MS = int(os.environ.get("RUNPOD_JOB_POLICY_TTL_MS", "604800000"))
 
 # Qwen settings
 QWEN_MODEL_ID = os.environ.get("QWEN_MODEL_ID", "Qwen/Qwen2.5-VL-3B-Instruct")
@@ -851,6 +881,15 @@ def upload_file(local_path: Path, key: str, content_type: str) -> None:
     )
 
 
+def upload_bytes(data: bytes, key: str, content_type: str) -> None:
+    s3.put_object(
+        Bucket=S3_BUCKET,
+        Key=key,
+        Body=data,
+        ContentType=content_type,
+    )
+
+
 def delete_s3_prefix(prefix: str) -> int:
     deleted = 0
     paginator = s3.get_paginator("list_objects_v2")
@@ -1272,8 +1311,34 @@ def scan_and_ingest_originals(album_ctx: Dict[str, Any], events: List[Dict[str, 
     return result
 
 def validate_s3_sources(album_ctx: Dict[str, Any], events: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Validate source objects without doing one S3 HeadObject per photo.
+
+    Old behavior was expensive: 1,233 photos => 1,233 HeadObject calls.
+    New behavior lists each event originals prefix once, builds a set of available keys,
+    then checks DB photo keys in memory.
+
+    This keeps validation, but reduces S3 calls dramatically.
+    """
+    started = time.time()
     album_id = album_ctx["album_id"]
     event_ids = [e["event_id"] for e in events]
+
+    # Build available key set with ListObjects per event prefix.
+    available_keys: set[str] = set()
+    per_event_listed = []
+
+    for event in events:
+        prefix = originals_prefix_for_event(album_ctx, event)
+        objects = list_s3_objects(prefix)
+        keys = {o.get("Key") for o in objects if o.get("Key")}
+        available_keys.update(keys)
+        per_event_listed.append({
+            "event": event.get("slug"),
+            "prefix": prefix,
+            "listed_objects": len(objects),
+            "listed_keys": len(keys),
+        })
 
     photos = db_all("""
         SELECT
@@ -1297,8 +1362,8 @@ def validate_s3_sources(album_ctx: Dict[str, Any], events: List[Dict[str, Any]])
             missing.append((photo, key, "missing source/original key"))
             continue
 
-        if not s3_key_exists(key):
-            missing.append((photo, key, "S3 HeadObject Not Found"))
+        if key not in available_keys:
+            missing.append((photo, key, "S3 source key not found in event prefix listing"))
 
     if missing:
         missing_ids = [str(p["id"]) for p, _, _ in missing]
@@ -1332,6 +1397,10 @@ def validate_s3_sources(album_ctx: Dict[str, Any], events: List[Dict[str, Any]])
             }
             for p, key, reason in missing[:25]
         ],
+        "s3_strategy": "list_prefix_once_per_event_no_head_object_loop",
+        "s3_list_calls": len(events),
+        "per_event_listed": per_event_listed,
+        "seconds": round(time.time() - started, 2),
     }
 
     print("S3 validation result:", result, flush=True)
@@ -2035,8 +2104,22 @@ def face_index_events(album_ctx: Dict[str, Any], events: List[Dict[str, Any]]) -
     failed = 0
     faces_count = 0
     errors = []
+    started = time.time()
 
-    for row in rows:
+    print(
+        "Face index start:",
+        {
+            "rows": len(rows),
+            "face_det_size": FACE_DET_SIZE,
+            "face_det_conf_threshold": FACE_DET_CONF_THRESHOLD,
+            "face_cluster_quality_threshold": FACE_CLUSTER_QUALITY_THRESHOLD,
+            "face_cluster_min_face_side": FACE_CLUSTER_MIN_FACE_SIDE,
+            "log_every": FACE_INDEX_LOG_EVERY,
+        },
+        flush=True,
+    )
+
+    for i, row in enumerate(rows, start=1):
         status, photo_id, face_count, err = face_index_one_photo(row)
         if status == "ok":
             ok += 1
@@ -2045,12 +2128,22 @@ def face_index_events(album_ctx: Dict[str, Any], events: List[Dict[str, Any]]) -
             failed += 1
             errors.append({"photo_id": photo_id, "error": err})
 
+        if FACE_INDEX_LOG_EVERY > 0 and (i % FACE_INDEX_LOG_EVERY == 0 or i == len(rows)):
+            elapsed = max(0.001, time.time() - started)
+            print(
+                f"Face index progress: {i}/{len(rows)} done, ok={ok}, failed={failed}, "
+                f"faces={faces_count}, rate={i / elapsed:.2f} photos/sec",
+                flush=True,
+            )
+
     result = {
         "rows": len(rows),
         "ok": ok,
         "failed": failed,
         "faces": faces_count,
         "errors": errors[:25],
+        "seconds": round(time.time() - started, 2),
+        "photos_per_second": round(len(rows) / max(0.001, time.time() - started), 3) if rows else 0,
     }
     print("Face index result:", result, flush=True)
     return result
@@ -2100,14 +2193,15 @@ def safe_add_new_people_without_touching_existing_names(
     crop_covers: bool = False,
 ) -> Dict[str, Any]:
     """
-    Safe reconciliation.
+    Safe reconciliation with fewer bad/singleton people.
 
-    - Labels only unlabeled faces.
-    - Preserves existing people and display names.
-    - For event runs, processes only those event faces.
-    - Still matches event faces against existing album-level people.
-    - Does not auto-merge duplicates.
-    - Expensive cover-crop/duplicate-candidate steps are opt-in.
+    Key behavior:
+    - All faces, including blurred/low-quality faces, can MATCH existing people.
+    - All faces can join a cluster that contains a good seed face.
+    - Low-quality singleton clusters do NOT create new people by default.
+      This reduces Person 1000+ noise from side/blur/tiny faces.
+    - Existing people and names are untouched.
+    - DB writes are batched with execute_values.
     """
     started = time.time()
     album_id = album_ctx["album_id"]
@@ -2126,6 +2220,10 @@ def safe_add_new_people_without_touching_existing_names(
             "event_ids": event_ids,
             "build_candidates": build_candidates,
             "crop_covers": crop_covers,
+            "create_low_quality_singleton_people": CREATE_LOW_QUALITY_SINGLETON_PEOPLE,
+            "low_quality_cluster_min_faces": LOW_QUALITY_CLUSTER_MIN_FACES,
+            "seed_quality_threshold": FACE_CLUSTER_QUALITY_THRESHOLD,
+            "seed_min_face_side": FACE_CLUSTER_MIN_FACE_SIDE,
         },
         flush=True,
     )
@@ -2138,7 +2236,9 @@ def safe_add_new_people_without_touching_existing_names(
             f.photo_id,
             f.embedding,
             f.face_quality_score,
-            f.detection_confidence
+            f.detection_confidence,
+            f.face_side,
+            COALESCE(f.is_cluster_seed, false) AS is_cluster_seed
         FROM faces f
         JOIN photos p ON p.id = f.photo_id
         WHERE f.album_id = %s::uuid
@@ -2193,6 +2293,7 @@ def safe_add_new_people_without_touching_existing_names(
     assigned_to_existing: List[Tuple[str, str]] = []
     remaining_indices = list(range(len(face_rows)))
 
+    # Blurred/low-quality faces are allowed to match existing people.
     if existing_people:
         people_vecs = [parse_pg_vector(p["centroid_embedding"]) for p in existing_people]
         P = np.stack(people_vecs).astype(np.float32)
@@ -2238,11 +2339,11 @@ def safe_add_new_people_without_touching_existing_names(
         flush=True,
     )
 
-    new_clusters: Dict[int, List[int]] = {}
+    raw_clusters: Dict[int, List[int]] = {}
 
     if remaining_indices:
         if len(remaining_indices) == 1:
-            new_clusters[0] = remaining_indices
+            raw_clusters[0] = remaining_indices
         else:
             X = np.stack([face_vecs[i] for i in remaining_indices]).astype(np.float32)
             dsu = DSU(len(remaining_indices))
@@ -2273,11 +2374,37 @@ def safe_add_new_people_without_touching_existing_names(
                 root = dsu.find(local_i)
                 temp.setdefault(root, []).append(original_i)
 
-            new_clusters = {idx: vals for idx, vals in enumerate(temp.values())}
+            raw_clusters = {idx: vals for idx, vals in enumerate(temp.values())}
+
+    # Keep blurred matches, but avoid creating new people from low-quality singletons.
+    # A cluster creates a new person if:
+    # - it contains at least one seed-quality face, OR
+    # - it has multiple matching low-quality faces, OR
+    # - explicit env allows all singleton people.
+    new_clusters: Dict[int, List[int]] = {}
+    skipped_low_quality_clusters = 0
+    skipped_low_quality_faces = 0
+
+    for cluster_i, face_indices in raw_clusters.items():
+        has_seed = any(bool(face_rows[i].get("is_cluster_seed")) for i in face_indices)
+        allow_low_quality_cluster = len(face_indices) >= LOW_QUALITY_CLUSTER_MIN_FACES
+        allow_singleton = CREATE_LOW_QUALITY_SINGLETON_PEOPLE
+
+        if has_seed or allow_low_quality_cluster or allow_singleton:
+            new_clusters[cluster_i] = face_indices
+        else:
+            skipped_low_quality_clusters += 1
+            skipped_low_quality_faces += len(face_indices)
 
     print(
         "safe_people_reconcile clusters prepared:",
-        {"new_clusters": len(new_clusters), "seconds": round(time.time() - started, 2)},
+        {
+            "raw_clusters": len(raw_clusters),
+            "new_clusters": len(new_clusters),
+            "skipped_low_quality_clusters": skipped_low_quality_clusters,
+            "skipped_low_quality_faces": skipped_low_quality_faces,
+            "seconds": round(time.time() - started, 2),
+        },
         flush=True,
     )
 
@@ -2307,6 +2434,9 @@ def safe_add_new_people_without_touching_existing_names(
                 """, (album_id,))
                 next_num = int(cur.fetchone()["max_num"] or 0) + 1
 
+                new_people_rows = []
+                face_update_rows: List[Tuple[str, str]] = []
+
                 for cluster_i, face_indices in new_clusters.items():
                     group_faces = [face_rows[i] for i in face_indices]
                     group_vecs = [face_vecs[i] for i in face_indices]
@@ -2318,10 +2448,42 @@ def safe_add_new_people_without_touching_existing_names(
                         reverse=True,
                     )[0]
 
+                    person_id = str(uuid.uuid4())
                     default_name = f"Person {next_num}"
+                    photo_count = len(set(str(f["photo_id"]) for f in group_faces))
 
-                    cur.execute("""
+                    new_people_rows.append((
+                        person_id,
+                        album_id,
+                        next_num,
+                        default_name,
+                        default_name,
+                        str(best_face["photo_id"]),
+                        vector_to_pg(centroid),
+                        len(group_faces),
+                        photo_count,
+                        photo_count,
+                    ))
+
+                    for f in group_faces:
+                        face_update_rows.append((person_id, str(f["id"])))
+
+                    if new_people_created > 0 and new_people_created % 100 == 0:
+                        print(
+                            "safe_people_reconcile prepared people:",
+                            {"prepared": new_people_created, "seconds": round(time.time() - started, 2)},
+                            flush=True,
+                        )
+
+                    next_num += 1
+                    new_people_created += 1
+
+                if new_people_rows:
+                    execute_values(
+                        cur,
+                        """
                         INSERT INTO people(
+                            id,
                             album_id,
                             person_number,
                             default_name,
@@ -2334,35 +2496,14 @@ def safe_add_new_people_without_touching_existing_names(
                             created_at,
                             updated_at
                         )
-                        VALUES (
-                            %s::uuid,
-                            %s,
-                            %s,
-                            %s,
-                            %s::uuid,
-                            %s::vector,
-                            %s,
-                            %s,
-                            %s,
-                            now(),
-                            now()
-                        )
-                        RETURNING id;
-                    """, (
-                        album_id,
-                        next_num,
-                        default_name,
-                        default_name,
-                        str(best_face["photo_id"]),
-                        vector_to_pg(centroid),
-                        len(group_faces),
-                        len(set(str(f["photo_id"]) for f in group_faces)),
-                        len(set(str(f["photo_id"]) for f in group_faces)),
-                    ))
+                        VALUES %s;
+                        """,
+                        new_people_rows,
+                        template="(%s::uuid,%s::uuid,%s,%s,%s,%s::uuid,%s::vector,%s,%s,%s,now(),now())",
+                        page_size=500,
+                    )
 
-                    person_id = str(cur.fetchone()["id"])
-                    face_update_rows = [(person_id, str(f["id"])) for f in group_faces]
-
+                if face_update_rows:
                     execute_values(
                         cur,
                         """
@@ -2373,21 +2514,8 @@ def safe_add_new_people_without_touching_existing_names(
                         """,
                         face_update_rows,
                         template="(%s, %s)",
+                        page_size=5000,
                     )
-
-                    print(
-                        "safe_people_reconcile created person:",
-                        {
-                            "person_number": next_num,
-                            "person_id": person_id,
-                            "cluster_index": cluster_i,
-                            "faces": len(group_faces),
-                        },
-                        flush=True,
-                    )
-
-                    next_num += 1
-                    new_people_created += 1
 
                 cur.execute("""
                     WITH stats AS (
@@ -2419,6 +2547,8 @@ def safe_add_new_people_without_touching_existing_names(
         {
             "assigned_to_existing": len(assigned_to_existing),
             "new_people_created": new_people_created,
+            "face_update_rows": len(assigned_to_existing) + sum(len(v) for v in new_clusters.values()),
+            "skipped_low_quality_faces": skipped_low_quality_faces,
             "seconds": round(time.time() - started, 2),
         },
         flush=True,
@@ -2440,7 +2570,11 @@ def safe_add_new_people_without_touching_existing_names(
         "unlabeled_faces": len(face_rows),
         "assigned_to_existing_people": len(assigned_to_existing),
         "remaining_faces_clustered": len(remaining_indices),
+        "raw_clusters": len(raw_clusters),
         "new_clusters": len(new_clusters),
+        "skipped_low_quality_clusters": skipped_low_quality_clusters,
+        "skipped_low_quality_faces": skipped_low_quality_faces,
+        "blurred_faces_can_match_existing_people": True,
         "new_people_created": new_people_created,
         "existing_people_untouched": True,
         "names_preserved": True,
@@ -2575,19 +2709,123 @@ def rebuild_photo_people_base_safe(
     print("rebuild_photo_people_base_safe result:", result, flush=True)
     return result
 
+def _crop_cover_bytes_from_image(img: Image.Image, r: Dict[str, Any]) -> bytes:
+    x1 = int(r["bbox_x1"])
+    y1 = int(r["bbox_y1"])
+    x2 = int(r["bbox_x2"])
+    y2 = int(r["bbox_y2"])
+
+    if x2 <= x1 or y2 <= y1:
+        raise RuntimeError(f"invalid face bbox for cover crop: {(x1, y1, x2, y2)}")
+
+    face_side = max(x2 - x1, y2 - y1)
+    pad = max(30, int(face_side * 0.35))
+
+    crop_x1 = max(0, x1 - pad)
+    crop_y1 = max(0, y1 - pad)
+    crop_x2 = min(img.width, x2 + pad)
+    crop_y2 = min(img.height, y2 + pad)
+
+    if crop_x2 <= crop_x1 or crop_y2 <= crop_y1:
+        raise RuntimeError(
+            f"invalid padded crop: {(crop_x1, crop_y1, crop_x2, crop_y2)} "
+            f"image_size={(img.width, img.height)}"
+        )
+
+    crop = img.crop((crop_x1, crop_y1, crop_x2, crop_y2))
+    if crop.width < 2 or crop.height < 2:
+        raise RuntimeError(f"cover crop too small: {(crop.width, crop.height)}")
+
+    crop = ImageOps.fit(crop, (256, 256), method=Image.Resampling.LANCZOS)
+    buf = io.BytesIO()
+    crop.save(buf, "JPEG", quality=90)
+    return buf.getvalue()
+
+
+def _process_cover_source_group(album_slug: str, ai_key: str, rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Download one AI image once, crop all selected people from it, upload cover JPEGs.
+    No DB writes here; caller batch-updates DB after futures complete.
+    """
+    started = time.time()
+    group_id = str(uuid.uuid4())
+    tmpdir = LOCAL_WORK / "covers_grouped" / group_id
+    update_rows: List[Tuple[str, str]] = []
+    errors = []
+
+    try:
+        tmpdir.mkdir(parents=True, exist_ok=True)
+        local_img = tmpdir / ("source" + (Path(ai_key).suffix or ".webp"))
+        download_file(ai_key, local_img)
+
+        img = Image.open(local_img)
+        img.load()
+        img = ImageOps.exif_transpose(img).convert("RGB")
+
+        for r in rows:
+            pid = str(r["person_id"])
+            try:
+                data = _crop_cover_bytes_from_image(img, r)
+                key = f"albums/{album_slug}/faces/{pid}/cover.jpg"
+                upload_bytes(data, key, "image/jpeg")
+                update_rows.append((key, pid))
+            except Exception as e:
+                errors.append({
+                    "person_id": pid,
+                    "person_number": r.get("person_number"),
+                    "photo_id": str(r.get("photo_id")) if r.get("photo_id") else None,
+                    "face_id": str(r.get("face_id")) if r.get("face_id") else None,
+                    "ai_input_s3_key": ai_key,
+                    "error": repr(e),
+                })
+
+        return {
+            "ai_input_s3_key": ai_key,
+            "people": len(rows),
+            "ok": len(update_rows),
+            "failed": len(errors),
+            "update_rows": update_rows,
+            "errors": errors,
+            "seconds": round(time.time() - started, 2),
+        }
+
+    except Exception as e:
+        return {
+            "ai_input_s3_key": ai_key,
+            "people": len(rows),
+            "ok": 0,
+            "failed": len(rows),
+            "update_rows": [],
+            "errors": [
+                {
+                    "person_id": str(r.get("person_id")),
+                    "person_number": r.get("person_number"),
+                    "photo_id": str(r.get("photo_id")) if r.get("photo_id") else None,
+                    "face_id": str(r.get("face_id")) if r.get("face_id") else None,
+                    "ai_input_s3_key": ai_key,
+                    "error": repr(e),
+                }
+                for r in rows[:25]
+            ],
+            "seconds": round(time.time() - started, 2),
+        }
+
+    finally:
+        try:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+        except Exception:
+            pass
+
+
 def crop_and_upload_missing_person_covers(album_ctx: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Backfill person cover crops.
+    Backfill person cover crops, optimized for S3 calls.
 
-    This is intentionally strict:
-    - looks for NULL or empty people.cover_face_s3_key
-    - only uses visible people
-    - picks the best labeled face that has a valid ai_input_s3_key
-    - uploads to albums/<album_slug>/faces/<person_id>/cover.jpg
-    - verifies the DB again after upload
+    Old behavior downloaded the same image repeatedly: one download per person.
+    New behavior groups by ai_input_s3_key/photo and downloads each image once,
+    then crops multiple person covers from that one decoded image.
 
-    If remaining_missing_covers > 0, process_album_events will fail the job when
-    STRICT_PERSON_COVERS=true so Qwen/Gemma is not enqueued with broken people covers.
+    DB updates are batched after uploads complete.
     """
     started = time.time()
     album_id = album_ctx["album_id"]
@@ -2618,6 +2856,7 @@ def crop_and_upload_missing_person_covers(album_ctx: Dict[str, Any]) -> Dict[str
               AND p2.ai_input_s3_key <> ''
               AND COALESCE(p2.is_deleted, false) = false
             ORDER BY
+              COALESCE(f.is_cover_candidate, false) DESC,
               f.face_quality_score DESC NULLS LAST,
               f.detection_confidence DESC NULLS LAST,
               f.created_at
@@ -2633,90 +2872,115 @@ def crop_and_upload_missing_person_covers(album_ctx: Dict[str, Any]) -> Dict[str
         ORDER BY pe.person_number;
     """, (album_id,))
 
+    if not people:
+        remaining = db_one("""
+            SELECT COUNT(*) AS remaining_missing_covers
+            FROM people
+            WHERE album_id = %s::uuid
+              AND COALESCE(is_hidden, false) = false
+              AND (
+                  cover_face_s3_key IS NULL
+                  OR cover_face_s3_key = ''
+              );
+        """, (album_id,))
+        with_cover = db_one("""
+            SELECT COUNT(*) AS with_covers
+            FROM people
+            WHERE album_id = %s::uuid
+              AND COALESCE(is_hidden, false) = false
+              AND cover_face_s3_key IS NOT NULL
+              AND cover_face_s3_key <> '';
+        """, (album_id,))
+        remaining_missing = int(remaining["remaining_missing_covers"] or 0) if remaining else 0
+        with_covers_count = int(with_cover["with_covers"] or 0) if with_cover else 0
+        result = {
+            "missing_covers_at_start": 0,
+            "ok": 0,
+            "failed": 0,
+            "with_covers": with_covers_count,
+            "remaining_missing_covers": remaining_missing,
+            "verified_no_missing_covers": remaining_missing == 0,
+            "errors": [],
+            "s3_strategy": "nothing_to_crop",
+            "seconds": round(time.time() - started, 2),
+        }
+        print("Cover crop result:", result, flush=True)
+        return result
+
+    groups: Dict[str, List[Dict[str, Any]]] = {}
+    for r in people:
+        ai_key = r.get("ai_input_s3_key")
+        if not ai_key:
+            continue
+        groups.setdefault(ai_key, []).append(r)
+
+    worker_count = max(1, min(COVER_MAX_WORKERS, len(groups)))
+    print(
+        "Cover crop grouped start:",
+        {
+            "people_missing_covers": len(people),
+            "unique_source_images": len(groups),
+            "workers": worker_count,
+            "log_every": COVER_LOG_EVERY,
+        },
+        flush=True,
+    )
+
     ok = 0
     failed = 0
     errors = []
+    update_rows: List[Tuple[str, str]] = []
+    processed_people = 0
+    processed_groups = 0
 
-    for r in people:
-        pid = str(r["person_id"])
-        tmpdir = LOCAL_WORK / "covers" / pid
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        futures = [
+            executor.submit(_process_cover_source_group, album_slug, ai_key, rows)
+            for ai_key, rows in groups.items()
+        ]
 
+        for future in as_completed(futures):
+            group_result = future.result()
+            processed_groups += 1
+            processed_people += int(group_result.get("people") or 0)
+            ok += int(group_result.get("ok") or 0)
+            failed += int(group_result.get("failed") or 0)
+            update_rows.extend(group_result.get("update_rows") or [])
+
+            for err in group_result.get("errors") or []:
+                if len(errors) < 25:
+                    errors.append(err)
+                print("Cover crop failed:", err, flush=True)
+
+            if COVER_LOG_EVERY > 0 and (processed_people % COVER_LOG_EVERY == 0 or processed_groups == len(groups)):
+                elapsed = max(0.001, time.time() - started)
+                print(
+                    f"Cover crop progress: people={processed_people}/{len(people)}, "
+                    f"groups={processed_groups}/{len(groups)}, ok={ok}, failed={failed}, "
+                    f"rate={processed_people / elapsed:.2f} people/sec",
+                    flush=True,
+                )
+
+    if update_rows:
+        conn = get_conn()
         try:
-            tmpdir.mkdir(parents=True, exist_ok=True)
-
-            ai_key = r.get("ai_input_s3_key")
-            if not ai_key:
-                raise RuntimeError("missing ai_input_s3_key for selected cover face")
-
-            img_local = tmpdir / "ai.webp"
-            download_file(ai_key, img_local)
-
-            img = Image.open(img_local)
-            img.load()
-            img = ImageOps.exif_transpose(img).convert("RGB")
-
-            x1 = int(r["bbox_x1"])
-            y1 = int(r["bbox_y1"])
-            x2 = int(r["bbox_x2"])
-            y2 = int(r["bbox_y2"])
-
-            if x2 <= x1 or y2 <= y1:
-                raise RuntimeError(
-                    f"invalid face bbox for cover crop: {(x1, y1, x2, y2)}"
-                )
-
-            face_side = max(x2 - x1, y2 - y1)
-            pad = max(30, int(face_side * 0.35))
-
-            crop_x1 = max(0, x1 - pad)
-            crop_y1 = max(0, y1 - pad)
-            crop_x2 = min(img.width, x2 + pad)
-            crop_y2 = min(img.height, y2 + pad)
-
-            if crop_x2 <= crop_x1 or crop_y2 <= crop_y1:
-                raise RuntimeError(
-                    f"invalid padded crop: {(crop_x1, crop_y1, crop_x2, crop_y2)} "
-                    f"image_size={(img.width, img.height)}"
-                )
-
-            crop = img.crop((crop_x1, crop_y1, crop_x2, crop_y2))
-            if crop.width < 2 or crop.height < 2:
-                raise RuntimeError(f"cover crop too small: {(crop.width, crop.height)}")
-
-            crop = ImageOps.fit(crop, (256, 256), method=Image.Resampling.LANCZOS)
-
-            out = tmpdir / "cover.jpg"
-            crop.save(out, "JPEG", quality=90)
-
-            key = f"albums/{album_slug}/faces/{pid}/cover.jpg"
-            upload_file(out, key, "image/jpeg")
-
-            execute_sql("""
-                UPDATE people
-                SET cover_face_s3_key = %s,
-                    updated_at = now()
-                WHERE id = %s::uuid;
-            """, (key, pid))
-
-            ok += 1
-
-        except Exception as e:
-            failed += 1
-            err = {
-                "person_id": pid,
-                "person_number": r.get("person_number"),
-                "photo_id": str(r.get("photo_id")) if r.get("photo_id") else None,
-                "face_id": str(r.get("face_id")) if r.get("face_id") else None,
-                "error": repr(e),
-            }
-            errors.append(err)
-            print("Cover crop failed:", err, flush=True)
-
+            with conn:
+                with conn.cursor() as cur:
+                    execute_values(
+                        cur,
+                        """
+                        UPDATE people AS p
+                        SET cover_face_s3_key = v.cover_face_s3_key,
+                            updated_at = now()
+                        FROM (VALUES %s) AS v(cover_face_s3_key, person_id)
+                        WHERE p.id = v.person_id::uuid;
+                        """,
+                        update_rows,
+                        template="(%s, %s)",
+                        page_size=1000,
+                    )
         finally:
-            try:
-                shutil.rmtree(tmpdir, ignore_errors=True)
-            except Exception:
-                pass
+            conn.close()
 
     remaining = db_one("""
         SELECT COUNT(*) AS remaining_missing_covers
@@ -2743,13 +3007,19 @@ def crop_and_upload_missing_person_covers(album_ctx: Dict[str, Any]) -> Dict[str
 
     result = {
         "missing_covers_at_start": len(people),
+        "unique_source_images": len(groups),
+        "s3_downloads_avoided_estimate": max(0, len(people) - len(groups)),
         "ok": ok,
         "failed": failed,
         "with_covers": with_covers_count,
         "remaining_missing_covers": remaining_missing,
         "verified_no_missing_covers": remaining_missing == 0,
         "errors": errors[:25],
+        "parallel": True,
+        "workers": worker_count,
+        "s3_strategy": "group_by_ai_input_s3_key_download_once_per_source_image",
         "seconds": round(time.time() - started, 2),
+        "people_per_second": round(len(people) / max(0.001, time.time() - started), 3),
     }
     print("Cover crop result:", result, flush=True)
     return result
@@ -4723,7 +4993,13 @@ def enqueue_qwen_after_face(payload: Dict[str, Any]) -> Dict[str, Any]:
             "qwen_payload": qwen_payload,
         }
 
-    body = json.dumps({"input": qwen_payload}).encode("utf-8")
+    body = json.dumps({
+        "input": qwen_payload,
+        "policy": {
+            "executionTimeout": RUNPOD_JOB_POLICY_TIMEOUT_MS,
+            "ttl": RUNPOD_JOB_POLICY_TTL_MS,
+        },
+    }).encode("utf-8")
     url = _qwen_run_url()
     req = urllib.request.Request(
         url,
@@ -4748,6 +5024,10 @@ def enqueue_qwen_after_face(payload: Dict[str, Any]) -> Dict[str, Any]:
         "enqueued": True,
         "run_url": url,
         "qwen_job": data,
+        "qwen_policy": {
+            "executionTimeout": RUNPOD_JOB_POLICY_TIMEOUT_MS,
+            "ttl": RUNPOD_JOB_POLICY_TTL_MS,
+        },
         "qwen_payload": qwen_payload,
     }
 
@@ -4759,7 +5039,13 @@ def forward_culling_mode_to_qwen(payload: Dict[str, Any]) -> Dict[str, Any]:
     if not RUNPOD_API_KEY:
         raise RuntimeError("RUNPOD_API_KEY missing; cannot forward culling mode to Qwen endpoint")
 
-    body = json.dumps({"input": payload}).encode("utf-8")
+    body = json.dumps({
+        "input": payload,
+        "policy": {
+            "executionTimeout": RUNPOD_JOB_POLICY_TIMEOUT_MS,
+            "ttl": RUNPOD_JOB_POLICY_TTL_MS,
+        },
+    }).encode("utf-8")
     url = _qwen_run_url()
     req = urllib.request.Request(
         url,
@@ -4865,6 +5151,12 @@ def process_album_events(job_id: str, payload: Dict[str, Any]) -> Dict[str, Any]
             "steps": steps,
             "compress_max_workers": COMPRESS_MAX_WORKERS,
             "compress_reuse_existing_ai_input": COMPRESS_REUSE_EXISTING_AI_INPUT,
+            "s3_validation_mode": S3_VALIDATION_MODE,
+            "face_index_log_every": FACE_INDEX_LOG_EVERY,
+            "cover_max_workers": COVER_MAX_WORKERS,
+            "cover_log_every": COVER_LOG_EVERY,
+            "create_low_quality_singleton_people": CREATE_LOW_QUALITY_SINGLETON_PEOPLE,
+            "low_quality_cluster_min_faces": LOW_QUALITY_CLUSTER_MIN_FACES,
             "db_pool_max_conn": DB_POOL_MAX_CONN,
             "strict_person_covers": STRICT_PERSON_COVERS,
             "strict_face_gpu": STRICT_FACE_GPU,
@@ -4909,18 +5201,40 @@ def process_album_events(job_id: str, payload: Dict[str, Any]) -> Dict[str, Any]
             "Scanning S3 originals and ingesting photos",
         )
         with stage_timer("ingest"):
-            results["steps"]["ingest"] = scan_and_ingest_originals(album_ctx, db_events)
+            ingest_result = scan_and_ingest_originals(album_ctx, db_events)
+            results["steps"]["ingest"] = ingest_result
         print_db_progress_snapshot(album_slug, "after_ingest")
 
-        update_job_status(
-            job_id,
-            "running",
-            "s3_validation",
-            "Validating S3 source objects",
+        force_validate_s3 = bool(payload.get("validate_s3", False))
+        created_rows = int((ingest_result or {}).get("created_rows") or 0)
+        should_validate_s3 = (
+            force_validate_s3
+            or S3_VALIDATION_MODE == "always"
+            or (S3_VALIDATION_MODE in {"created_only", "created_or_forced"} and created_rows > 0)
         )
-        with stage_timer("s3_validation"):
-            results["steps"]["s3_validation"] = validate_s3_sources(album_ctx, db_events)
-        print_db_progress_snapshot(album_slug, "after_s3_validation")
+
+        if should_validate_s3:
+            update_job_status(
+                job_id,
+                "running",
+                "s3_validation",
+                "Validating S3 source objects",
+            )
+            with stage_timer("s3_validation"):
+                results["steps"]["s3_validation"] = validate_s3_sources(album_ctx, db_events)
+            print_db_progress_snapshot(album_slug, "after_s3_validation")
+        else:
+            results["steps"]["s3_validation"] = {
+                "skipped": True,
+                "reason": "No newly ingested rows and validate_s3 was not forced",
+                "s3_validation_mode": S3_VALIDATION_MODE,
+                "created_rows": created_rows,
+            }
+            print(
+                "[STAGE_SKIP] s3_validation skipped: "
+                f"mode={S3_VALIDATION_MODE}, created_rows={created_rows}, force_validate_s3={force_validate_s3}",
+                flush=True,
+            )
     else:
         print("[STAGE_SKIP] ingest=false; skipping S3 scan and S3 validation", flush=True)
 
