@@ -97,5 +97,5 @@ app.prepare(ctx_id=-1, det_size=(640, 640))
 print('InsightFace buffalo_l downloaded')
 PY
 
-COPY handler.py /app/handler.py
+COPY handler.py face_dedup.py /app/
 CMD ["python", "-u", "/app/handler.py"]

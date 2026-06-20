@@ -28,6 +28,12 @@ from tqdm import tqdm
 
 import runpod
 
+from face_dedup import (
+    cluster_face_indices,
+    deduplicate_detection_indices,
+    match_face_indices_iteratively,
+)
+
 # ============================================================
 # STARTUP CONFIG / STAGE DEBUGGING
 # ============================================================
@@ -138,6 +144,8 @@ def print_startup_config_snapshot(job: Optional[Dict[str, Any]] = None, label: s
             "FACE_DET_CONF_THRESHOLD",
             "FACE_CLUSTER_QUALITY_THRESHOLD",
             "FACE_CLUSTER_MIN_FACE_SIDE",
+            "FACE_MATCH_REFERENCES_PER_PERSON",
+            "FACE_DUPLICATE_IOU_THRESHOLD",
             "INSIGHTFACE_ALLOWED_MODULES",
 
             # downstream image-text endpoint/provider
@@ -377,6 +385,8 @@ FACE_CLUSTER_MIN_FACE_SIDE = int(os.environ.get("FACE_CLUSTER_MIN_FACE_SIDE", "4
 PEOPLE_MATCH_EXISTING_SIM_THRESHOLD = float(os.environ.get("PEOPLE_MATCH_EXISTING_SIM_THRESHOLD", "0.58"))
 NEW_FACE_CLUSTER_SIM_THRESHOLD = float(os.environ.get("NEW_FACE_CLUSTER_SIM_THRESHOLD", "0.62"))
 DUPLICATE_CANDIDATE_SIM_THRESHOLD = float(os.environ.get("DUPLICATE_CANDIDATE_SIM_THRESHOLD", "0.55"))
+FACE_MATCH_REFERENCES_PER_PERSON = int(os.environ.get("FACE_MATCH_REFERENCES_PER_PERSON", "8"))
+FACE_DUPLICATE_IOU_THRESHOLD = float(os.environ.get("FACE_DUPLICATE_IOU_THRESHOLD", "0.65"))
 
 # Split-worker / GPU strictness settings.
 # Keep strict=true: the worker fails if detector/recognizer are not backed by CUDA.
@@ -1997,7 +2007,25 @@ def face_index_one_photo(row: Dict[str, Any]) -> Tuple[str, str, int, Optional[s
         if img is None:
             raise RuntimeError("cv2 could not read ai input")
 
-        faces = face_app.get(img)
+        detected_faces = face_app.get(img)
+        kept_detection_indices = deduplicate_detection_indices(
+            [face.bbox.tolist() for face in detected_faces],
+            [float(face.det_score) for face in detected_faces],
+            FACE_DUPLICATE_IOU_THRESHOLD,
+        )
+        faces = [detected_faces[i] for i in kept_detection_indices]
+        duplicate_detections_removed = len(detected_faces) - len(faces)
+        if duplicate_detections_removed:
+            print(
+                "Removed overlapping face detections:",
+                {
+                    "photo_id": photo_id,
+                    "detected": len(detected_faces),
+                    "kept": len(faces),
+                    "removed": duplicate_detections_removed,
+                },
+                flush=True,
+            )
         insert_rows = []
 
         h, w = img.shape[:2]
@@ -2114,6 +2142,7 @@ def face_index_events(album_ctx: Dict[str, Any], events: List[Dict[str, Any]]) -
             "face_det_conf_threshold": FACE_DET_CONF_THRESHOLD,
             "face_cluster_quality_threshold": FACE_CLUSTER_QUALITY_THRESHOLD,
             "face_cluster_min_face_side": FACE_CLUSTER_MIN_FACE_SIDE,
+            "face_duplicate_iou_threshold": FACE_DUPLICATE_IOU_THRESHOLD,
             "log_every": FACE_INDEX_LOG_EVERY,
         },
         flush=True,
@@ -2290,91 +2319,82 @@ def safe_add_new_people_without_touching_existing_names(
 
     face_vecs = [parse_pg_vector(r["embedding"]) for r in face_rows]
 
-    assigned_to_existing: List[Tuple[str, str]] = []
-    remaining_indices = list(range(len(face_rows)))
+    references_by_person: Dict[str, List[np.ndarray]] = {
+        str(person["id"]): [parse_pg_vector(person["centroid_embedding"])]
+        for person in existing_people
+    }
 
-    # Blurred/low-quality faces are allowed to match existing people.
-    if existing_people:
-        people_vecs = [parse_pg_vector(p["centroid_embedding"]) for p in existing_people]
-        P = np.stack(people_vecs).astype(np.float32)
-        still_remaining: List[int] = []
-        batch_size = 2048
-
-        for start_i in range(0, len(face_vecs), batch_size):
-            end_i = min(len(face_vecs), start_i + batch_size)
-            F = np.stack(face_vecs[start_i:end_i]).astype(np.float32)
-            sims = F @ P.T
-            best_people_idx = sims.argmax(axis=1)
-            best_scores = sims.max(axis=1)
-
-            for local_i, score in enumerate(best_scores):
-                global_i = start_i + local_i
-                if float(score) >= PEOPLE_MATCH_EXISTING_SIM_THRESHOLD:
-                    person = existing_people[int(best_people_idx[local_i])]
-                    assigned_to_existing.append((str(person["id"]), str(face_rows[global_i]["id"])))
-                else:
-                    still_remaining.append(global_i)
-
-            print(
-                "safe_people_reconcile match progress:",
-                {
-                    "processed_faces": end_i,
-                    "total_faces": len(face_vecs),
-                    "assigned_so_far": len(assigned_to_existing),
-                    "remaining_so_far": len(still_remaining),
-                    "seconds": round(time.time() - started, 2),
-                },
-                flush=True,
+    # A centroid alone is too brittle across pose, age, lighting, and eyewear.
+    # Add several high-quality face exemplars for each existing identity.
+    if existing_people and FACE_MATCH_REFERENCES_PER_PERSON > 0:
+        representative_rows = db_all("""
+            WITH ranked_faces AS (
+                SELECT
+                    f.person_id,
+                    f.embedding,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY f.person_id
+                        ORDER BY f.face_quality_score DESC NULLS LAST, f.created_at DESC
+                    ) AS reference_rank
+                FROM faces f
+                JOIN people p ON p.id = f.person_id
+                WHERE f.album_id = %s::uuid
+                  AND f.person_id IS NOT NULL
+                  AND f.embedding IS NOT NULL
+                  AND COALESCE(f.is_cluster_seed, false) = true
+                  AND COALESCE(p.is_hidden, false) = false
             )
+            SELECT person_id, embedding
+            FROM ranked_faces
+            WHERE reference_rank <= %s;
+        """, (album_id, FACE_MATCH_REFERENCES_PER_PERSON))
 
-        remaining_indices = still_remaining
+        for reference in representative_rows:
+            person_id = str(reference["person_id"])
+            if person_id in references_by_person:
+                references_by_person[person_id].append(
+                    parse_pg_vector(reference["embedding"])
+                )
+
+    # Re-run matching after adding each pass of successful faces as references.
+    # A clear face can therefore bridge a hard-angle/blurred view to the same
+    # existing person without clustering every album face up front.
+    (
+        assigned_existing_by_index,
+        remaining_indices,
+        references_by_person,
+        match_passes,
+    ) = match_face_indices_iteratively(
+        face_vecs,
+        range(len(face_rows)),
+        references_by_person,
+        PEOPLE_MATCH_EXISTING_SIM_THRESHOLD,
+    )
+
+    assigned_to_existing = [
+        (str(person_id), str(face_rows[face_index]["id"]))
+        for face_index, person_id in assigned_existing_by_index.items()
+    ]
+    unmatched_clusters = cluster_face_indices(
+        face_vecs,
+        remaining_indices,
+        NEW_FACE_CLUSTER_SIM_THRESHOLD,
+    )
+    raw_clusters: Dict[int, List[int]] = {
+        cluster_i: list(face_indices)
+        for cluster_i, face_indices in enumerate(unmatched_clusters)
+    }
 
     print(
         "safe_people_reconcile matching complete:",
         {
+            "match_passes": match_passes,
             "assigned_to_existing": len(assigned_to_existing),
-            "remaining_for_new_clusters": len(remaining_indices),
+            "remaining_for_new_clusters": sum(len(v) for v in raw_clusters.values()),
             "seconds": round(time.time() - started, 2),
         },
         flush=True,
     )
-
-    raw_clusters: Dict[int, List[int]] = {}
-
-    if remaining_indices:
-        if len(remaining_indices) == 1:
-            raw_clusters[0] = remaining_indices
-        else:
-            X = np.stack([face_vecs[i] for i in remaining_indices]).astype(np.float32)
-            dsu = DSU(len(remaining_indices))
-            block = 512
-
-            for start_i in range(0, len(remaining_indices), block):
-                end_i = min(len(remaining_indices), start_i + block)
-                sims_block = X[start_i:end_i] @ X.T
-
-                for local_i in range(end_i - start_i):
-                    i = start_i + local_i
-                    for j in range(i + 1, len(remaining_indices)):
-                        if float(sims_block[local_i, j]) >= NEW_FACE_CLUSTER_SIM_THRESHOLD:
-                            dsu.union(i, j)
-
-                print(
-                    "safe_people_reconcile cluster progress:",
-                    {
-                        "processed_remaining": end_i,
-                        "total_remaining": len(remaining_indices),
-                        "seconds": round(time.time() - started, 2),
-                    },
-                    flush=True,
-                )
-
-            temp: Dict[int, List[int]] = {}
-            for local_i, original_i in enumerate(remaining_indices):
-                root = dsu.find(local_i)
-                temp.setdefault(root, []).append(original_i)
-
-            raw_clusters = {idx: vals for idx, vals in enumerate(temp.values())}
 
     # Keep blurred matches, but avoid creating new people from low-quality singletons.
     # A cluster creates a new person if:
@@ -2410,6 +2430,8 @@ def safe_add_new_people_without_touching_existing_names(
 
     conn = get_conn()
     new_people_created = 0
+    affected_person_ids = set(assigned_existing_by_index.values())
+    centroid_refreshed_ids = set()
 
     try:
         with conn:
@@ -2449,6 +2471,7 @@ def safe_add_new_people_without_touching_existing_names(
                     )[0]
 
                     person_id = str(uuid.uuid4())
+                    affected_person_ids.add(person_id)
                     default_name = f"Person {next_num}"
                     photo_count = len(set(str(f["photo_id"]) for f in group_faces))
 
@@ -2517,6 +2540,48 @@ def safe_add_new_people_without_touching_existing_names(
                         page_size=5000,
                     )
 
+                # Existing centroids previously stayed frozen at creation time.
+                # Refresh identities touched by this run from their seed-quality
+                # faces so subsequent events match against current appearances.
+                if affected_person_ids:
+                    cur.execute("""
+                        SELECT person_id, embedding
+                        FROM faces
+                        WHERE album_id = %s::uuid
+                          AND person_id = ANY(%s::uuid[])
+                          AND embedding IS NOT NULL
+                          AND COALESCE(is_cluster_seed, false) = true;
+                    """, (album_id, list(affected_person_ids)))
+
+                    centroid_vectors: Dict[str, List[np.ndarray]] = {}
+                    for row in cur.fetchall():
+                        centroid_vectors.setdefault(str(row["person_id"]), []).append(
+                            parse_pg_vector(row["embedding"])
+                        )
+
+                    centroid_updates = [
+                        (vector_to_pg(mean_normalized(vectors)), person_id)
+                        for person_id, vectors in centroid_vectors.items()
+                        if vectors
+                    ]
+                    centroid_refreshed_ids.update(
+                        person_id for _, person_id in centroid_updates
+                    )
+                    if centroid_updates:
+                        execute_values(
+                            cur,
+                            """
+                            UPDATE people AS p
+                            SET centroid_embedding = v.embedding::vector,
+                                updated_at = now()
+                            FROM (VALUES %s) AS v(embedding, person_id)
+                            WHERE p.id = v.person_id::uuid;
+                            """,
+                            centroid_updates,
+                            template="(%s, %s)",
+                            page_size=500,
+                        )
+
                 cur.execute("""
                     WITH stats AS (
                         SELECT
@@ -2569,7 +2634,8 @@ def safe_add_new_people_without_touching_existing_names(
         "event_ids": event_ids,
         "unlabeled_faces": len(face_rows),
         "assigned_to_existing_people": len(assigned_to_existing),
-        "remaining_faces_clustered": len(remaining_indices),
+        "match_passes": match_passes,
+        "remaining_faces_clustered": sum(len(v) for v in raw_clusters.values()),
         "raw_clusters": len(raw_clusters),
         "new_clusters": len(new_clusters),
         "skipped_low_quality_clusters": skipped_low_quality_clusters,
@@ -2577,6 +2643,9 @@ def safe_add_new_people_without_touching_existing_names(
         "blurred_faces_can_match_existing_people": True,
         "new_people_created": new_people_created,
         "existing_people_untouched": True,
+        "existing_people_centroids_refreshed": len(
+            centroid_refreshed_ids.intersection(references_by_person.keys())
+        ),
         "names_preserved": True,
         "rebuild_photo_people": rebuild_result,
         "cover_crop": cover_result,
@@ -5157,6 +5226,8 @@ def process_album_events(job_id: str, payload: Dict[str, Any]) -> Dict[str, Any]
             "cover_log_every": COVER_LOG_EVERY,
             "create_low_quality_singleton_people": CREATE_LOW_QUALITY_SINGLETON_PEOPLE,
             "low_quality_cluster_min_faces": LOW_QUALITY_CLUSTER_MIN_FACES,
+            "face_match_references_per_person": FACE_MATCH_REFERENCES_PER_PERSON,
+            "face_duplicate_iou_threshold": FACE_DUPLICATE_IOU_THRESHOLD,
             "db_pool_max_conn": DB_POOL_MAX_CONN,
             "strict_person_covers": STRICT_PERSON_COVERS,
             "strict_face_gpu": STRICT_FACE_GPU,
