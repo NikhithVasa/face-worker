@@ -790,6 +790,12 @@ def ensure_photo_image_embedding_schema() -> None:
 
 def prepare_photo_image_embedding_model() -> int:
     if not OPENROUTER_API_KEY:
+        image_embedding_log(
+            "configuration_error",
+            missing_environment_variable="OPENROUTER_API_KEY",
+            model=PHOTO_IMAGE_EMBED_MODEL_ID,
+            action="Add OPENROUTER_API_KEY to the RunPod endpoint/template environment",
+        )
         raise RuntimeError(
             "OPENROUTER_API_KEY missing; cannot generate Gemini image embeddings"
         )
@@ -817,6 +823,12 @@ def prepare_photo_image_embedding_model() -> int:
             f"Invalidated {invalidated} full-image embeddings from a different model",
             flush=True,
         )
+    image_embedding_log(
+        "model_prepared",
+        model=PHOTO_IMAGE_EMBED_MODEL_ID,
+        dimension=PHOTO_IMAGE_EMBED_DIM,
+        invalidated_different_model_vectors=invalidated,
+    )
     return invalidated
 
 
@@ -1696,18 +1708,46 @@ def compress_events(
     pending_embedding_files: List[Tuple[Dict[str, Any], Path]] = []
     embedding_result = empty_photo_image_embedding_result()
     embedding_attempted_ids: List[str] = []
+    submit_batch_size = (
+        PHOTO_IMAGE_EMBED_BATCH_SIZE + worker_count
+        if embed_images
+        else len(rows)
+    )
+    embedding_candidate_count = sum(
+        1
+        for row in rows
+        if embed_images
+        and (force_image_embedding or row.get("image_embedding") is None)
+    )
+    embedding_total_batches = sum(
+        math.ceil(
+            sum(
+                1
+                for row in compression_batch
+                if force_image_embedding or row.get("image_embedding") is None
+            )
+            / PHOTO_IMAGE_EMBED_BATCH_SIZE
+        )
+        for compression_batch in chunks(rows, submit_batch_size)
+        if embed_images
+    )
+    embedding_batch_index = 0
 
     def flush_embedding_batch() -> None:
-        nonlocal embedding_result
+        nonlocal embedding_batch_index, embedding_result
         if not pending_embedding_files:
             return
 
+        embedding_batch_index += 1
         batch_items = list(pending_embedding_files)
         pending_embedding_files.clear()
         embedding_attempted_ids.extend(str(photo["id"]) for photo, _ in batch_items)
         batch_result = embed_photo_image_files(
             batch_items,
             source="compression_local_ai_input",
+            batch_index=embedding_batch_index,
+            total_batches=embedding_total_batches,
+            force=force_image_embedding,
         )
         embedding_result = merge_photo_image_embedding_results(
             embedding_result,
@@ -1719,12 +1759,20 @@ def compress_events(
         f"reuse_existing_ai_input={COMPRESS_REUSE_EXISTING_AI_INPUT}",
         flush=True,
     )
+    if embed_images:
+        image_embedding_log(
+            "compression_embedding_plan",
+            compression_rows=len(rows),
+            embedding_candidates=embedding_candidate_count,
+            total_batches=embedding_total_batches,
+            force=force_image_embedding,
+            selection_mode=(
+                "overwrite_all_selected"
+                if force_image_embedding
+                else "missing_only"
+            ),
+        )
 
-    submit_batch_size = (
-        PHOTO_IMAGE_EMBED_BATCH_SIZE + worker_count
-        if embed_images
-        else len(rows)
-    )
     completed = 0
 
     with ThreadPoolExecutor(max_workers=worker_count) as executor:
@@ -1803,6 +1851,7 @@ def empty_photo_image_embedding_result() -> Dict[str, Any]:
         "rows": 0,
         "ok": 0,
         "failed": 0,
+        "overwritten": 0,
         "errors": [],
         "embedding_model": PHOTO_IMAGE_EMBED_MODEL_ID,
         "embedding_dim": PHOTO_IMAGE_EMBED_DIM,
@@ -1819,6 +1868,10 @@ def merge_photo_image_embedding_results(
     merged["rows"] = int(left.get("rows") or 0) + int(right.get("rows") or 0)
     merged["ok"] = int(left.get("ok") or 0) + int(right.get("ok") or 0)
     merged["failed"] = int(left.get("failed") or 0) + int(right.get("failed") or 0)
+    merged["overwritten"] = (
+        int(left.get("overwritten") or 0)
+        + int(right.get("overwritten") or 0)
+    )
     merged["errors"] = list(left.get("errors") or []) + list(right.get("errors") or [])
     merged["errors"] = merged["errors"][:25]
 
@@ -1828,6 +1881,19 @@ def merge_photo_image_embedding_results(
             sources[source] = sources.get(source, 0) + int(count or 0)
     merged["sources"] = sources
     return merged
+
+
+def image_embedding_log(event: str, **fields: Any) -> None:
+    payload = {
+        "event": event,
+        "utc": datetime.now(timezone.utc).isoformat(),
+        **fields,
+    }
+    print(
+        "[IMAGE_EMBED] "
+        + json.dumps(payload, default=str, sort_keys=True, separators=(",", ":")),
+        flush=True,
+    )
 
 
 def mark_photo_image_embedding_status(photo_ids: List[str], status: str) -> None:
@@ -1842,13 +1908,16 @@ def mark_photo_image_embedding_status(photo_ids: List[str], status: str) -> None
     """, (status, photo_ids))
 
 
-def image_embedding_data_url(local_path: Path) -> str:
+def image_embedding_data_url(local_path: Path) -> Tuple[str, Dict[str, Any]]:
+    started = time.time()
     image = read_image_any(local_path)
     try:
+        original_size = image.size
         image.thumbnail(
             (PHOTO_IMAGE_EMBED_MAX_SIDE, PHOTO_IMAGE_EMBED_MAX_SIDE),
             Image.Resampling.LANCZOS,
         )
+        resized_size = image.size
         output = io.BytesIO()
         image.save(
             output,
@@ -1856,13 +1925,25 @@ def image_embedding_data_url(local_path: Path) -> str:
             quality=PHOTO_IMAGE_EMBED_JPEG_QUALITY,
             optimize=True,
         )
-        encoded = base64.b64encode(output.getvalue()).decode("ascii")
-        return f"data:image/jpeg;base64,{encoded}"
+        jpeg_bytes = output.getvalue()
+        encoded = base64.b64encode(jpeg_bytes).decode("ascii")
+        return f"data:image/jpeg;base64,{encoded}", {
+            "original_width": original_size[0],
+            "original_height": original_size[1],
+            "embedding_width": resized_size[0],
+            "embedding_height": resized_size[1],
+            "jpeg_bytes": len(jpeg_bytes),
+            "prepare_ms": round((time.time() - started) * 1000, 2),
+        }
     finally:
         image.close()
 
 
-def request_openrouter_image_embeddings(data_urls: List[str]) -> np.ndarray:
+def request_openrouter_image_embeddings(
+    data_urls: List[str],
+    batch_index: Optional[int] = None,
+    total_batches: Optional[int] = None,
+) -> np.ndarray:
     import urllib.error
     import urllib.request
 
@@ -1887,6 +1968,16 @@ def request_openrouter_image_embeddings(data_urls: List[str]) -> np.ndarray:
         "dimensions": PHOTO_IMAGE_EMBED_DIM,
         "encoding_format": "float",
     }).encode("utf-8")
+    request_started = time.time()
+    image_embedding_log(
+        "openrouter_request_start",
+        batch_index=batch_index,
+        total_batches=total_batches,
+        image_count=len(data_urls),
+        model=PHOTO_IMAGE_EMBED_MODEL_ID,
+        dimension=PHOTO_IMAGE_EMBED_DIM,
+        request_bytes=len(request_body),
+    )
 
     request = urllib.request.Request(
         "https://openrouter.ai/api/v1/embeddings",
@@ -1902,12 +1993,33 @@ def request_openrouter_image_embeddings(data_urls: List[str]) -> np.ndarray:
 
     try:
         with urllib.request.urlopen(request, timeout=120) as response:
+            http_status = getattr(response, "status", 200)
             payload = json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
         error_body = e.read().decode("utf-8", errors="replace")
+        image_embedding_log(
+            "openrouter_request_failed",
+            batch_index=batch_index,
+            total_batches=total_batches,
+            image_count=len(data_urls),
+            http_status=e.code,
+            duration_ms=round((time.time() - request_started) * 1000, 2),
+            error=error_body[:1000],
+        )
         raise RuntimeError(
             f"OpenRouter image embedding failed HTTP {e.code}: {error_body}"
         ) from e
+    except Exception as e:
+        image_embedding_log(
+            "openrouter_request_failed",
+            batch_index=batch_index,
+            total_batches=total_batches,
+            image_count=len(data_urls),
+            http_status=None,
+            duration_ms=round((time.time() - request_started) * 1000, 2),
+            error=repr(e),
+        )
+        raise
 
     response_rows = payload.get("data")
     if not isinstance(response_rows, list) or len(response_rows) != len(data_urls):
@@ -1934,13 +2046,31 @@ def request_openrouter_image_embeddings(data_urls: List[str]) -> np.ndarray:
         raise RuntimeError("OpenRouter image embedding response contains non-finite values")
 
     norms = np.linalg.norm(vectors, axis=1, keepdims=True)
-    return vectors / np.maximum(norms, 1e-12)
+    normalized = vectors / np.maximum(norms, 1e-12)
+    image_embedding_log(
+        "openrouter_request_done",
+        batch_index=batch_index,
+        total_batches=total_batches,
+        image_count=len(data_urls),
+        http_status=http_status,
+        duration_ms=round((time.time() - request_started) * 1000, 2),
+        response_rows=len(response_rows),
+        vector_shape=list(vectors.shape),
+        norm_min=round(float(norms.min()), 6),
+        norm_max=round(float(norms.max()), 6),
+        usage=payload.get("usage"),
+    )
+    return normalized
 
 
 def embed_photo_image_files(
     items: List[Tuple[Dict[str, Any], Path]],
     source: str,
+    batch_index: Optional[int] = None,
+    total_batches: Optional[int] = None,
+    force: bool = False,
 ) -> Dict[str, Any]:
+    batch_started = time.time()
     result = empty_photo_image_embedding_result()
     result["rows"] = len(items)
     result["sources"] = {source: len(items)}
@@ -1948,18 +2078,62 @@ def embed_photo_image_files(
         return result
 
     photo_ids = [str(photo["id"]) for photo, _ in items]
+    existing_count = sum(
+        1
+        for photo, _ in items
+        if photo.get("image_embedding") is not None
+    )
+    result["overwritten"] = existing_count if force else 0
+    image_embedding_log(
+        "batch_start",
+        batch_index=batch_index,
+        total_batches=total_batches,
+        source=source,
+        image_count=len(items),
+        photo_ids=photo_ids,
+        force=force,
+        existing_vectors=existing_count,
+        overwrite_existing=bool(force and existing_count),
+    )
     mark_photo_image_embedding_status(photo_ids, "processing")
 
     prepared: List[Dict[str, Any]] = []
     data_urls: List[str] = []
 
     try:
-        for photo, local_path in items:
+        for item_index, (photo, local_path) in enumerate(items, start=1):
+            photo_started = time.time()
+            photo_id = str(photo["id"])
+            image_embedding_log(
+                "photo_prepare_start",
+                batch_index=batch_index,
+                total_batches=total_batches,
+                item_index=item_index,
+                batch_size=len(items),
+                photo_id=photo_id,
+                file_name=photo.get("file_name"),
+                source=source,
+                local_suffix=local_path.suffix,
+                local_bytes=local_path.stat().st_size if local_path.exists() else None,
+                overwrite=bool(force and photo.get("image_embedding") is not None),
+            )
             try:
-                data_urls.append(image_embedding_data_url(local_path))
+                data_url, image_meta = image_embedding_data_url(local_path)
+                data_urls.append(data_url)
                 prepared.append(photo)
+                image_embedding_log(
+                    "photo_prepare_done",
+                    batch_index=batch_index,
+                    total_batches=total_batches,
+                    item_index=item_index,
+                    batch_size=len(items),
+                    photo_id=photo_id,
+                    file_name=photo.get("file_name"),
+                    data_url_chars=len(data_url),
+                    duration_ms=round((time.time() - photo_started) * 1000, 2),
+                    **image_meta,
+                )
             except Exception as e:
-                photo_id = str(photo["id"])
                 result["failed"] += 1
                 result["errors"].append({
                     "photo_id": photo_id,
@@ -1967,12 +2141,39 @@ def embed_photo_image_files(
                     "error": repr(e),
                 })
                 mark_photo_image_embedding_status([photo_id], "failed")
+                image_embedding_log(
+                    "photo_prepare_failed",
+                    batch_index=batch_index,
+                    total_batches=total_batches,
+                    item_index=item_index,
+                    batch_size=len(items),
+                    photo_id=photo_id,
+                    file_name=photo.get("file_name"),
+                    duration_ms=round((time.time() - photo_started) * 1000, 2),
+                    error=repr(e),
+                )
 
         if not data_urls:
+            image_embedding_log(
+                "batch_done",
+                batch_index=batch_index,
+                total_batches=total_batches,
+                source=source,
+                rows=result["rows"],
+                ok=result["ok"],
+                failed=result["failed"],
+                overwritten=result["overwritten"],
+                duration_ms=round((time.time() - batch_started) * 1000, 2),
+                reason="no_images_prepared",
+            )
             return result
 
         try:
-            vectors = request_openrouter_image_embeddings(data_urls)
+            vectors = request_openrouter_image_embeddings(
+                data_urls,
+                batch_index=batch_index,
+                total_batches=total_batches,
+            )
             update_rows = [
                 (
                     str(photo["id"]),
@@ -1982,6 +2183,15 @@ def embed_photo_image_files(
                 for index, photo in enumerate(prepared)
             ]
 
+            db_started = time.time()
+            image_embedding_log(
+                "database_update_start",
+                batch_index=batch_index,
+                total_batches=total_batches,
+                rows=len(update_rows),
+                photo_ids=[row[0] for row in update_rows],
+                force=force,
+            )
             conn = get_conn()
             try:
                 with conn:
@@ -1996,10 +2206,43 @@ def embed_photo_image_files(
                             FROM (VALUES %s) AS v(photo_id, embedding, embedding_model)
                             WHERE p.id=v.photo_id::uuid;
                         """, update_rows, template="(%s,%s,%s)")
+                        updated_rows = cur.rowcount
             finally:
                 conn.close()
 
+            if updated_rows != len(update_rows):
+                raise RuntimeError(
+                    "Image embedding database update count mismatch: "
+                    f"expected {len(update_rows)}, updated {updated_rows}"
+                )
+
             result["ok"] += len(prepared)
+            image_embedding_log(
+                "database_update_done",
+                batch_index=batch_index,
+                total_batches=total_batches,
+                rows=updated_rows,
+                duration_ms=round((time.time() - db_started) * 1000, 2),
+            )
+            for index, photo in enumerate(prepared):
+                image_embedding_log(
+                    "photo_completed",
+                    batch_index=batch_index,
+                    total_batches=total_batches,
+                    item_index=index + 1,
+                    batch_size=len(prepared),
+                    photo_id=str(photo["id"]),
+                    file_name=photo.get("file_name"),
+                    model=PHOTO_IMAGE_EMBED_MODEL_ID,
+                    dimension=PHOTO_IMAGE_EMBED_DIM,
+                    normalized_vector_norm=round(
+                        float(np.linalg.norm(vectors[index])),
+                        6,
+                    ),
+                    overwritten=bool(
+                        force and photo.get("image_embedding") is not None
+                    ),
+                )
 
         except Exception as e:
             failed_ids = [str(photo["id"]) for photo in prepared]
@@ -2009,6 +2252,15 @@ def embed_photo_image_files(
                 "error": repr(e),
             })
             mark_photo_image_embedding_status(failed_ids, "failed")
+            image_embedding_log(
+                "batch_failed",
+                batch_index=batch_index,
+                total_batches=total_batches,
+                source=source,
+                photo_ids=failed_ids,
+                duration_ms=round((time.time() - batch_started) * 1000, 2),
+                error=repr(e),
+            )
 
     finally:
         for _, local_path in items:
@@ -2018,15 +2270,33 @@ def embed_photo_image_files(
                 pass
 
     result["errors"] = result["errors"][:25]
+    image_embedding_log(
+        "batch_done",
+        batch_index=batch_index,
+        total_batches=total_batches,
+        source=source,
+        rows=result["rows"],
+        ok=result["ok"],
+        failed=result["failed"],
+        overwritten=result["overwritten"],
+        duration_ms=round((time.time() - batch_started) * 1000, 2),
+    )
     return result
 
 
-def download_photo_image_input(photo: Dict[str, Any]) -> Path:
+def download_photo_image_input(
+    photo: Dict[str, Any],
+    batch_index: Optional[int] = None,
+    total_batches: Optional[int] = None,
+) -> Path:
     photo_id = str(photo["id"])
-    keys = []
-    for key in (photo.get("ai_input_s3_key"), photo.get("original_s3_key")):
-        if key and key not in keys:
-            keys.append(key)
+    keys: List[Tuple[str, str]] = []
+    for key_type, key in (
+        ("ai_input_s3_key", photo.get("ai_input_s3_key")),
+        ("original_s3_key", photo.get("original_s3_key")),
+    ):
+        if key and all(existing_key != key for _, existing_key in keys):
+            keys.append((key_type, key))
 
     if not keys:
         raise RuntimeError("missing ai_input_s3_key and original_s3_key")
@@ -2035,14 +2305,71 @@ def download_photo_image_input(photo: Dict[str, Any]) -> Path:
     tmpdir = LOCAL_WORK / "image-embedding" / photo_id
     tmpdir.mkdir(parents=True, exist_ok=True)
 
-    for key in keys:
+    image_embedding_log(
+        "photo_download_start",
+        batch_index=batch_index,
+        total_batches=total_batches,
+        photo_id=photo_id,
+        file_name=photo.get("file_name"),
+        candidate_keys=[key_type for key_type, _ in keys],
+    )
+
+    for attempt, (key_type, key) in enumerate(keys, start=1):
+        attempt_started = time.time()
         suffix = Path(key).suffix or ".img"
         local_path = tmpdir / f"input{suffix}"
+        image_embedding_log(
+            "photo_download_attempt",
+            batch_index=batch_index,
+            total_batches=total_batches,
+            photo_id=photo_id,
+            file_name=photo.get("file_name"),
+            attempt=attempt,
+            key_type=key_type,
+            s3_key=key,
+        )
         try:
-            return download_file(key, local_path)
+            downloaded_path = download_file(key, local_path)
+            image_embedding_log(
+                "photo_download_done",
+                batch_index=batch_index,
+                total_batches=total_batches,
+                photo_id=photo_id,
+                file_name=photo.get("file_name"),
+                attempt=attempt,
+                key_type=key_type,
+                s3_key=key,
+                local_bytes=(
+                    downloaded_path.stat().st_size
+                    if downloaded_path.exists()
+                    else None
+                ),
+                duration_ms=round((time.time() - attempt_started) * 1000, 2),
+            )
+            return downloaded_path
         except Exception as e:
             errors.append(f"{key}: {repr(e)}")
+            image_embedding_log(
+                "photo_download_attempt_failed",
+                batch_index=batch_index,
+                total_batches=total_batches,
+                photo_id=photo_id,
+                file_name=photo.get("file_name"),
+                attempt=attempt,
+                key_type=key_type,
+                s3_key=key,
+                duration_ms=round((time.time() - attempt_started) * 1000, 2),
+                error=repr(e),
+            )
 
+    image_embedding_log(
+        "photo_download_failed",
+        batch_index=batch_index,
+        total_batches=total_batches,
+        photo_id=photo_id,
+        file_name=photo.get("file_name"),
+        errors=errors,
+    )
     raise RuntimeError("all image embedding S3 inputs failed: " + "; ".join(errors))
 
 
@@ -2064,6 +2391,33 @@ def image_embed_events(
     ]
     params: List[Any] = [album_id, event_ids]
 
+    scope_stats = db_one("""
+        SELECT
+          COUNT(*) AS eligible_photos,
+          COUNT(*) FILTER (WHERE p.image_embedding IS NULL) AS missing_vectors,
+          COUNT(*) FILTER (
+            WHERE p.image_embedding IS NOT NULL
+              AND p.image_embedding_model = %s
+          ) AS existing_current_model_vectors,
+          COUNT(*) FILTER (
+            WHERE p.image_embedding IS NOT NULL
+              AND p.image_embedding_model IS DISTINCT FROM %s
+          ) AS existing_other_model_vectors
+        FROM photos p
+        WHERE p.album_id=%s::uuid
+          AND p.album_event_id = ANY(%s::uuid[])
+          AND COALESCE(p.is_deleted,false)=false
+          AND (
+            NULLIF(p.ai_input_s3_key,'') IS NOT NULL
+            OR NULLIF(p.original_s3_key,'') IS NOT NULL
+          );
+    """, (
+        PHOTO_IMAGE_EMBED_MODEL_ID,
+        PHOTO_IMAGE_EMBED_MODEL_ID,
+        album_id,
+        event_ids,
+    )) or {}
+
     if not force:
         where_parts.append("p.image_embedding IS NULL")
     if excluded:
@@ -2078,7 +2432,37 @@ def image_embed_events(
     """, tuple(params))
 
     result = empty_photo_image_embedding_result()
+    selected_existing = sum(
+        1 for row in rows if row.get("image_embedding") is not None
+    )
+    total_batches = math.ceil(len(rows) / PHOTO_IMAGE_EMBED_BATCH_SIZE) if rows else 0
+    image_embedding_log(
+        "selection_done",
+        album_id=album_id,
+        event_ids=event_ids,
+        force=force,
+        selection_mode="overwrite_all_selected" if force else "missing_only",
+        eligible_photos=int(scope_stats.get("eligible_photos") or 0),
+        missing_vectors=int(scope_stats.get("missing_vectors") or 0),
+        existing_current_model_vectors=int(
+            scope_stats.get("existing_current_model_vectors") or 0
+        ),
+        existing_other_model_vectors=int(
+            scope_stats.get("existing_other_model_vectors") or 0
+        ),
+        selected_rows=len(rows),
+        selected_existing_vectors=selected_existing,
+        excluded_photo_count=len(excluded),
+        batch_size=PHOTO_IMAGE_EMBED_BATCH_SIZE,
+        total_batches=total_batches,
+        model=PHOTO_IMAGE_EMBED_MODEL_ID,
+        dimension=PHOTO_IMAGE_EMBED_DIM,
+    )
     if not rows:
+        result["force"] = force
+        result["selection_mode"] = (
+            "overwrite_all_selected" if force else "missing_only"
+        )
         print("Full-image embedding result:", result, flush=True)
         return result
 
@@ -2088,12 +2472,29 @@ def image_embed_events(
         min(PHOTO_IMAGE_EMBED_DOWNLOAD_WORKERS, PHOTO_IMAGE_EMBED_BATCH_SIZE),
     )
 
-    for batch in chunks(rows, PHOTO_IMAGE_EMBED_BATCH_SIZE):
+    for batch_index, batch in enumerate(
+        chunks(rows, PHOTO_IMAGE_EMBED_BATCH_SIZE),
+        start=1,
+    ):
+        image_embedding_log(
+            "batch_download_start",
+            batch_index=batch_index,
+            total_batches=total_batches,
+            image_count=len(batch),
+            photo_ids=[str(photo["id"]) for photo in batch],
+            workers=min(worker_count, len(batch)),
+            force=force,
+        )
         downloaded: List[Tuple[Dict[str, Any], Path]] = []
 
         with ThreadPoolExecutor(max_workers=min(worker_count, len(batch))) as executor:
             future_to_photo = {
-                executor.submit(download_photo_image_input, photo): photo
+                executor.submit(
+                    download_photo_image_input,
+                    photo,
+                    batch_index,
+                    total_batches,
+                ): photo
                 for photo in batch
             }
             for future in as_completed(future_to_photo):
@@ -2118,12 +2519,43 @@ def image_embed_events(
                         ignore_errors=True,
                     )
 
-        batch_result = embed_photo_image_files(downloaded, source="s3_download")
+        image_embedding_log(
+            "batch_download_done",
+            batch_index=batch_index,
+            total_batches=total_batches,
+            requested=len(batch),
+            downloaded=len(downloaded),
+            failed=len(batch) - len(downloaded),
+            downloaded_photo_ids=[str(photo["id"]) for photo, _ in downloaded],
+        )
+        batch_result = embed_photo_image_files(
+            downloaded,
+            source="s3_download",
+            batch_index=batch_index,
+            total_batches=total_batches,
+            force=force,
+        )
         result = merge_photo_image_embedding_results(result, batch_result)
+        image_embedding_log(
+            "pipeline_progress",
+            batch_index=batch_index,
+            total_batches=total_batches,
+            processed=result["ok"] + result["failed"],
+            total_selected=len(rows),
+            ok=result["ok"],
+            failed=result["failed"],
+            overwritten=result["overwritten"],
+            elapsed_seconds=round(time.time() - started, 2),
+        )
 
     result["seconds"] = round(time.time() - started, 2)
     result["force"] = force
+    result["selection_mode"] = (
+        "overwrite_all_selected" if force else "missing_only"
+    )
+    result["selected_existing_vectors"] = selected_existing
     result["download_workers"] = worker_count
+    image_embedding_log("pipeline_done", **result)
     print("Full-image embedding result:", result, flush=True)
     return result
 
@@ -5743,6 +6175,11 @@ def process_album_events(job_id: str, payload: Dict[str, Any]) -> Dict[str, Any]
     events = normalize_event_source_prefixes(album_slug, payload["events"])
 
     steps = normalize_steps(payload)
+    force_image_embedding = bool(
+        payload.get("force", False)
+        or payload.get("force_image_embedding", False)
+        or payload.get("overwrite_image_embeddings", False)
+    )
 
     print(
         "[PIPELINE_CONFIG] " + _safe_json({
@@ -5760,6 +6197,12 @@ def process_album_events(job_id: str, payload: Dict[str, Any]) -> Dict[str, Any]
             "photo_image_embed_batch_size": PHOTO_IMAGE_EMBED_BATCH_SIZE,
             "photo_image_embed_download_workers": PHOTO_IMAGE_EMBED_DOWNLOAD_WORKERS,
             "photo_image_embed_max_side": PHOTO_IMAGE_EMBED_MAX_SIDE,
+            "photo_image_embed_force": force_image_embedding,
+            "photo_image_embed_selection_mode": (
+                "overwrite_all_selected"
+                if force_image_embedding
+                else "missing_only"
+            ),
             "openrouter_api_key_set": bool(OPENROUTER_API_KEY),
             "s3_validation_mode": S3_VALIDATION_MODE,
             "face_index_log_every": FACE_INDEX_LOG_EVERY,
@@ -5859,11 +6302,24 @@ def process_album_events(job_id: str, payload: Dict[str, Any]) -> Dict[str, Any]
     else:
         print("[STAGE_SKIP] ingest=false; skipping S3 scan and S3 validation", flush=True)
 
-    force_image_embedding = bool(
-        payload.get("force", False)
-        or payload.get("force_image_embedding", False)
-    )
     if steps.get("image_embedding", False):
+        image_embedding_log(
+            "job_start",
+            job_id=job_id,
+            album_slug=album_slug,
+            event_slugs=[event["slug"] for event in db_events],
+            force=force_image_embedding,
+            selection_mode=(
+                "overwrite_all_selected"
+                if force_image_embedding
+                else "missing_only"
+            ),
+            model=PHOTO_IMAGE_EMBED_MODEL_ID,
+            dimension=PHOTO_IMAGE_EMBED_DIM,
+            batch_size=PHOTO_IMAGE_EMBED_BATCH_SIZE,
+            download_workers=PHOTO_IMAGE_EMBED_DOWNLOAD_WORKERS,
+            openrouter_api_key_set=bool(OPENROUTER_API_KEY),
+        )
         update_job_status(
             job_id,
             "running",
@@ -5925,9 +6381,22 @@ def process_album_events(job_id: str, payload: Dict[str, Any]) -> Dict[str, Any]
                 force=force_image_embedding,
                 exclude_photo_ids=inline_embedding_attempted_ids,
             )
-            results["steps"]["image_embedding"] = merge_photo_image_embedding_results(
+            final_embedding_result = merge_photo_image_embedding_results(
                 inline_embedding_result,
                 backfill_embedding_result,
+            )
+            final_embedding_result["force"] = force_image_embedding
+            final_embedding_result["selection_mode"] = (
+                "overwrite_all_selected"
+                if force_image_embedding
+                else "missing_only"
+            )
+            results["steps"]["image_embedding"] = final_embedding_result
+            image_embedding_log(
+                "job_done",
+                job_id=job_id,
+                album_slug=album_slug,
+                **final_embedding_result,
             )
         print_db_progress_snapshot(album_slug, "after_image_embedding")
     else:
