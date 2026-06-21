@@ -12,9 +12,6 @@ tqdm
 
 torch==2.5.1
 torchvision==0.20.1
-transformers>=4.49.0
-sentencepiece
-safetensors
 
 onnxruntime-gpu==1.20.1
 nvidia-cudnn-cu12==9.1.0.70
