@@ -3,6 +3,7 @@ import re
 import io
 import gc
 import json
+import base64
 import time
 import uuid
 import math
@@ -133,6 +134,11 @@ def print_startup_config_snapshot(job: Optional[Dict[str, Any]] = None, label: s
             "PHOTO_IMAGE_EMBED_DIM",
             "PHOTO_IMAGE_EMBED_BATCH_SIZE",
             "PHOTO_IMAGE_EMBED_DOWNLOAD_WORKERS",
+            "PHOTO_IMAGE_EMBED_MAX_SIDE",
+            "PHOTO_IMAGE_EMBED_JPEG_QUALITY",
+            "OPENROUTER_API_KEY",
+            "OPENROUTER_APP_TITLE",
+            "OPENROUTER_HTTP_REFERER",
             "COVER_MAX_WORKERS",
             "COVER_LOG_EVERY",
             "CREATE_LOW_QUALITY_SINGLETON_PEOPLE",
@@ -367,19 +373,38 @@ S3_VALIDATION_MODE = os.environ.get("S3_VALIDATION_MODE", "created_only").lower(
 FACE_INDEX_LOG_EVERY = int(os.environ.get("FACE_INDEX_LOG_EVERY", "25"))
 
 # Full-image embeddings used for image-to-text semantic search.
-# SigLIP 2 base uses one shared 768-dimensional space for images and text.
+# Gemini Embedding 2 maps image and text inputs into one shared vector space.
 PHOTO_IMAGE_EMBED_MODEL_ID = os.environ.get(
     "PHOTO_IMAGE_EMBED_MODEL_ID",
-    "google/siglip2-base-patch16-224",
+    "google/gemini-embedding-2",
 )
 PHOTO_IMAGE_EMBED_DIM = int(os.environ.get("PHOTO_IMAGE_EMBED_DIM", "768"))
-PHOTO_IMAGE_EMBED_BATCH_SIZE = max(
-    1,
-    int(os.environ.get("PHOTO_IMAGE_EMBED_BATCH_SIZE", "16")),
+PHOTO_IMAGE_EMBED_BATCH_SIZE = min(
+    6,
+    max(
+        1,
+        int(os.environ.get("PHOTO_IMAGE_EMBED_BATCH_SIZE", "6")),
+    ),
 )
 PHOTO_IMAGE_EMBED_DOWNLOAD_WORKERS = max(
     1,
     int(os.environ.get("PHOTO_IMAGE_EMBED_DOWNLOAD_WORKERS", "4")),
+)
+PHOTO_IMAGE_EMBED_MAX_SIDE = max(
+    224,
+    int(os.environ.get("PHOTO_IMAGE_EMBED_MAX_SIDE", "768")),
+)
+PHOTO_IMAGE_EMBED_JPEG_QUALITY = int(
+    os.environ.get("PHOTO_IMAGE_EMBED_JPEG_QUALITY", "82")
+)
+OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY")
+OPENROUTER_APP_TITLE = os.environ.get(
+    "OPENROUTER_APP_TITLE",
+    "Saathidesk AI Photo Search",
+)
+OPENROUTER_HTTP_REFERER = os.environ.get(
+    "OPENROUTER_HTTP_REFERER",
+    "https://www.saathidesk.com",
 )
 
 # Person cover crop is S3 + CPU JPEG work. It is safe to parallelize by source image group.
@@ -483,8 +508,6 @@ _PROCESS_VISION_INFO = None
 _TEXT_EMBED_MODEL = None
 _IMAGE_EMBED_MODEL = None
 _IMAGE_EMBED_PROCESSOR = None
-_PHOTO_IMAGE_EMBED_MODEL = None
-_PHOTO_IMAGE_EMBED_PROCESSOR = None
 
 
 # DB connection pooling/retry settings.
@@ -750,6 +773,7 @@ def ensure_photo_image_embedding_schema() -> None:
                       AND NOT a.attisdropped;
                 """)
                 row = cur.fetchone()
+
     finally:
         conn.close()
 
@@ -762,6 +786,38 @@ def ensure_photo_image_embedding_schema() -> None:
         )
 
     _TABLE_COLUMNS_CACHE.pop("photos", None)
+
+
+def prepare_photo_image_embedding_model() -> int:
+    if not OPENROUTER_API_KEY:
+        raise RuntimeError(
+            "OPENROUTER_API_KEY missing; cannot generate Gemini image embeddings"
+        )
+
+    conn = get_conn()
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    UPDATE photos
+                    SET image_embedding=NULL,
+                        image_embedding_model=NULL,
+                        image_embedding_status='pending',
+                        image_embedded_at=NULL,
+                        updated_at=now()
+                    WHERE image_embedding IS NOT NULL
+                      AND image_embedding_model IS DISTINCT FROM %s;
+                """, (PHOTO_IMAGE_EMBED_MODEL_ID,))
+                invalidated = cur.rowcount
+    finally:
+        conn.close()
+
+    if invalidated:
+        print(
+            f"Invalidated {invalidated} full-image embeddings from a different model",
+            flush=True,
+        )
+    return invalidated
 
 
 # ============================================================
@@ -1786,69 +1842,105 @@ def mark_photo_image_embedding_status(photo_ids: List[str], status: str) -> None
     """, (status, photo_ids))
 
 
-def load_photo_image_embed_model():
-    global _PHOTO_IMAGE_EMBED_MODEL, _PHOTO_IMAGE_EMBED_PROCESSOR
-
-    if (
-        _PHOTO_IMAGE_EMBED_MODEL is not None
-        and _PHOTO_IMAGE_EMBED_PROCESSOR is not None
-    ):
-        return _PHOTO_IMAGE_EMBED_MODEL, _PHOTO_IMAGE_EMBED_PROCESSOR
-
-    import torch
-    from transformers import AutoModel, AutoProcessor
-
-    print(
-        f"Loading full-image embedding model: {PHOTO_IMAGE_EMBED_MODEL_ID}",
-        flush=True,
-    )
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    processor = AutoProcessor.from_pretrained(PHOTO_IMAGE_EMBED_MODEL_ID)
-    model = AutoModel.from_pretrained(
-        PHOTO_IMAGE_EMBED_MODEL_ID,
-        torch_dtype=torch.float16 if device == "cuda" else torch.float32,
-    )
-
-    if not callable(getattr(model, "get_image_features", None)):
-        raise RuntimeError(
-            f"{PHOTO_IMAGE_EMBED_MODEL_ID} does not expose get_image_features()"
+def image_embedding_data_url(local_path: Path) -> str:
+    image = read_image_any(local_path)
+    try:
+        image.thumbnail(
+            (PHOTO_IMAGE_EMBED_MAX_SIDE, PHOTO_IMAGE_EMBED_MAX_SIDE),
+            Image.Resampling.LANCZOS,
         )
-    if not callable(getattr(model, "get_text_features", None)):
+        output = io.BytesIO()
+        image.save(
+            output,
+            "JPEG",
+            quality=PHOTO_IMAGE_EMBED_JPEG_QUALITY,
+            optimize=True,
+        )
+        encoded = base64.b64encode(output.getvalue()).decode("ascii")
+        return f"data:image/jpeg;base64,{encoded}"
+    finally:
+        image.close()
+
+
+def request_openrouter_image_embeddings(data_urls: List[str]) -> np.ndarray:
+    import urllib.error
+    import urllib.request
+
+    if not OPENROUTER_API_KEY:
         raise RuntimeError(
-            f"{PHOTO_IMAGE_EMBED_MODEL_ID} does not expose get_text_features(); "
-            "image and future search text embeddings must use the same model"
+            "OPENROUTER_API_KEY missing; cannot generate Gemini image embeddings"
         )
 
-    text_config = getattr(model.config, "text_config", None)
-    configured_dim = (
-        getattr(text_config, "projection_size", None)
-        or getattr(text_config, "hidden_size", None)
+    request_body = json.dumps({
+        "model": PHOTO_IMAGE_EMBED_MODEL_ID,
+        "input": [
+            {
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": data_url},
+                    }
+                ]
+            }
+            for data_url in data_urls
+        ],
+        "dimensions": PHOTO_IMAGE_EMBED_DIM,
+        "encoding_format": "float",
+    }).encode("utf-8")
+
+    request = urllib.request.Request(
+        "https://openrouter.ai/api/v1/embeddings",
+        data=request_body,
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+            "Content-Type": "application/json",
+            "HTTP-Referer": OPENROUTER_HTTP_REFERER,
+            "X-Title": OPENROUTER_APP_TITLE,
+        },
     )
-    if configured_dim and int(configured_dim) != PHOTO_IMAGE_EMBED_DIM:
+
+    try:
+        with urllib.request.urlopen(request, timeout=120) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        error_body = e.read().decode("utf-8", errors="replace")
         raise RuntimeError(
-            f"{PHOTO_IMAGE_EMBED_MODEL_ID} produces {configured_dim}-dimensional "
-            f"embeddings, but photos.image_embedding is vector({PHOTO_IMAGE_EMBED_DIM})"
+            f"OpenRouter image embedding failed HTTP {e.code}: {error_body}"
+        ) from e
+
+    response_rows = payload.get("data")
+    if not isinstance(response_rows, list) or len(response_rows) != len(data_urls):
+        raise RuntimeError(
+            "OpenRouter image embedding response count mismatch: "
+            f"expected {len(data_urls)}, got "
+            f"{len(response_rows) if isinstance(response_rows, list) else 'invalid'}"
         )
 
-    model.to(device)
-    model.eval()
-
-    _PHOTO_IMAGE_EMBED_MODEL = model
-    _PHOTO_IMAGE_EMBED_PROCESSOR = processor
-    print(
-        f"Full-image embedding model loaded on {device}; "
-        f"dimension={PHOTO_IMAGE_EMBED_DIM}",
-        flush=True,
+    ordered_rows = sorted(
+        response_rows,
+        key=lambda row: int(row.get("index", 0)),
     )
-    return model, processor
+    vectors = np.asarray(
+        [row.get("embedding") for row in ordered_rows],
+        dtype=np.float32,
+    )
+    if vectors.shape != (len(data_urls), PHOTO_IMAGE_EMBED_DIM):
+        raise RuntimeError(
+            f"Unexpected image embedding shape {vectors.shape}; "
+            f"expected ({len(data_urls)}, {PHOTO_IMAGE_EMBED_DIM})"
+        )
+    if not np.isfinite(vectors).all():
+        raise RuntimeError("OpenRouter image embedding response contains non-finite values")
+
+    norms = np.linalg.norm(vectors, axis=1, keepdims=True)
+    return vectors / np.maximum(norms, 1e-12)
 
 
 def embed_photo_image_files(
     items: List[Tuple[Dict[str, Any], Path]],
     source: str,
 ) -> Dict[str, Any]:
-    import torch
-
     result = empty_photo_image_embedding_result()
     result["rows"] = len(items)
     result["sources"] = {source: len(items)}
@@ -1859,12 +1951,12 @@ def embed_photo_image_files(
     mark_photo_image_embedding_status(photo_ids, "processing")
 
     prepared: List[Dict[str, Any]] = []
-    images: List[Image.Image] = []
+    data_urls: List[str] = []
 
     try:
         for photo, local_path in items:
             try:
-                images.append(read_image_any(local_path))
+                data_urls.append(image_embedding_data_url(local_path))
                 prepared.append(photo)
             except Exception as e:
                 photo_id = str(photo["id"])
@@ -1876,35 +1968,11 @@ def embed_photo_image_files(
                 })
                 mark_photo_image_embedding_status([photo_id], "failed")
 
-        if not images:
+        if not data_urls:
             return result
 
         try:
-            model, processor = load_photo_image_embed_model()
-            device = next(model.parameters()).device
-            inputs = processor(images=images, return_tensors="pt")
-            inputs = {
-                key: value.to(device) if hasattr(value, "to") else value
-                for key, value in inputs.items()
-            }
-
-            with torch.inference_mode():
-                features = model.get_image_features(**inputs)
-                if hasattr(features, "pooler_output"):
-                    features = features.pooler_output
-                features = features / features.norm(
-                    p=2,
-                    dim=-1,
-                    keepdim=True,
-                ).clamp_min(1e-12)
-
-            if features.ndim != 2 or features.shape[1] != PHOTO_IMAGE_EMBED_DIM:
-                raise RuntimeError(
-                    f"Unexpected image embedding shape {tuple(features.shape)}; "
-                    f"expected (*, {PHOTO_IMAGE_EMBED_DIM})"
-                )
-
-            vectors = features.detach().cpu().numpy().astype(np.float32)
+            vectors = request_openrouter_image_embeddings(data_urls)
             update_rows = [
                 (
                     str(photo["id"]),
@@ -1932,9 +2000,6 @@ def embed_photo_image_files(
                 conn.close()
 
             result["ok"] += len(prepared)
-            del inputs, features
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
 
         except Exception as e:
             failed_ids = [str(photo["id"]) for photo in prepared]
@@ -1946,11 +2011,6 @@ def embed_photo_image_files(
             mark_photo_image_embedding_status(failed_ids, "failed")
 
     finally:
-        for image in images:
-            try:
-                image.close()
-            except Exception:
-                pass
         for _, local_path in items:
             try:
                 shutil.rmtree(local_path.parent, ignore_errors=True)
@@ -5699,6 +5759,8 @@ def process_album_events(job_id: str, payload: Dict[str, Any]) -> Dict[str, Any]
             "photo_image_embed_dim": PHOTO_IMAGE_EMBED_DIM,
             "photo_image_embed_batch_size": PHOTO_IMAGE_EMBED_BATCH_SIZE,
             "photo_image_embed_download_workers": PHOTO_IMAGE_EMBED_DOWNLOAD_WORKERS,
+            "photo_image_embed_max_side": PHOTO_IMAGE_EMBED_MAX_SIDE,
+            "openrouter_api_key_set": bool(OPENROUTER_API_KEY),
             "s3_validation_mode": S3_VALIDATION_MODE,
             "face_index_log_every": FACE_INDEX_LOG_EVERY,
             "cover_max_workers": COVER_MAX_WORKERS,
@@ -5801,6 +5863,20 @@ def process_album_events(job_id: str, payload: Dict[str, Any]) -> Dict[str, Any]
         payload.get("force", False)
         or payload.get("force_image_embedding", False)
     )
+    if steps.get("image_embedding", False):
+        update_job_status(
+            job_id,
+            "running",
+            "image_embedding_model",
+            "Preparing Gemini image embedding model migration",
+        )
+        with stage_timer("image_embedding_model"):
+            results["steps"]["image_embedding_model"] = {
+                "model": PHOTO_IMAGE_EMBED_MODEL_ID,
+                "dimension": PHOTO_IMAGE_EMBED_DIM,
+                "invalidated": prepare_photo_image_embedding_model(),
+            }
+
     inline_embedding_result = empty_photo_image_embedding_result()
     inline_embedding_attempted_ids: List[str] = []
 
@@ -5840,7 +5916,7 @@ def process_album_events(job_id: str, payload: Dict[str, Any]) -> Dict[str, Any]
             job_id,
             "running",
             "image_embedding",
-            "Generating batched SigLIP 2 full-image embeddings",
+            "Generating batched Gemini full-image embeddings through OpenRouter",
         )
         with stage_timer("image_embedding"):
             backfill_embedding_result = image_embed_events(
