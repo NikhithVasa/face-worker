@@ -74,11 +74,15 @@ RUN mkdir -p \
 
 RUN python - <<'PY'
 import torch
+import transformers
+from transformers import AutoModel, AutoProcessor
 print('torch:', torch.__version__)
 print('torch cuda:', torch.version.cuda)
 print('cuda available at build:', torch.cuda.is_available())
 print('device count at build:', torch.cuda.device_count())
 print('cudnn:', torch.backends.cudnn.version())
+print('transformers:', transformers.__version__)
+print('SigLIP 2 AutoModel/AutoProcessor imports OK')
 PY
 
 RUN python - <<'PY'

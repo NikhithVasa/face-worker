@@ -129,6 +129,10 @@ def print_startup_config_snapshot(job: Optional[Dict[str, Any]] = None, label: s
             "COMPRESS_REUSE_EXISTING_AI_INPUT",
             "S3_VALIDATION_MODE",
             "FACE_INDEX_LOG_EVERY",
+            "PHOTO_IMAGE_EMBED_MODEL_ID",
+            "PHOTO_IMAGE_EMBED_DIM",
+            "PHOTO_IMAGE_EMBED_BATCH_SIZE",
+            "PHOTO_IMAGE_EMBED_DOWNLOAD_WORKERS",
             "COVER_MAX_WORKERS",
             "COVER_LOG_EVERY",
             "CREATE_LOW_QUALITY_SINGLETON_PEOPLE",
@@ -262,6 +266,8 @@ def print_db_progress_snapshot(album_slug: str, stage_name: str) -> None:
               COUNT(*) FILTER (WHERE p.face_index_status='completed') AS face_completed,
               COUNT(*) FILTER (WHERE p.face_index_status='pending') AS face_pending,
               COUNT(*) FILTER (WHERE p.face_index_status='failed') AS face_failed,
+              COUNT(*) FILTER (WHERE p.image_embedding IS NOT NULL) AS image_embedding_completed,
+              COUNT(*) FILTER (WHERE p.image_embedding IS NULL) AS image_embedding_missing,
               COUNT(*) FILTER (WHERE p.qwen_status='completed') AS qwen_completed,
               COUNT(*) FILTER (WHERE p.qwen_status='pending') AS qwen_pending,
               COUNT(*) FILTER (WHERE p.qwen_status='failed') AS qwen_failed,
@@ -359,6 +365,22 @@ S3_VALIDATION_MODE = os.environ.get("S3_VALIDATION_MODE", "created_only").lower(
 # Face index is usually single-worker because InsightFace/GPU sessions are not reliably thread-safe,
 # but progress logging prevents the long silent section.
 FACE_INDEX_LOG_EVERY = int(os.environ.get("FACE_INDEX_LOG_EVERY", "25"))
+
+# Full-image embeddings used for image-to-text semantic search.
+# SigLIP 2 base uses one shared 768-dimensional space for images and text.
+PHOTO_IMAGE_EMBED_MODEL_ID = os.environ.get(
+    "PHOTO_IMAGE_EMBED_MODEL_ID",
+    "google/siglip2-base-patch16-224",
+)
+PHOTO_IMAGE_EMBED_DIM = int(os.environ.get("PHOTO_IMAGE_EMBED_DIM", "768"))
+PHOTO_IMAGE_EMBED_BATCH_SIZE = max(
+    1,
+    int(os.environ.get("PHOTO_IMAGE_EMBED_BATCH_SIZE", "16")),
+)
+PHOTO_IMAGE_EMBED_DOWNLOAD_WORKERS = max(
+    1,
+    int(os.environ.get("PHOTO_IMAGE_EMBED_DOWNLOAD_WORKERS", "4")),
+)
 
 # Person cover crop is S3 + CPU JPEG work. It is safe to parallelize by source image group.
 COVER_MAX_WORKERS = int(os.environ.get("COVER_MAX_WORKERS", "4"))
@@ -461,6 +483,8 @@ _PROCESS_VISION_INFO = None
 _TEXT_EMBED_MODEL = None
 _IMAGE_EMBED_MODEL = None
 _IMAGE_EMBED_PROCESSOR = None
+_PHOTO_IMAGE_EMBED_MODEL = None
+_PHOTO_IMAGE_EMBED_PROCESSOR = None
 
 
 # DB connection pooling/retry settings.
@@ -699,6 +723,45 @@ def execute_sql_best_effort(sql: str, params: Tuple[Any, ...] = ()) -> bool:
     except Exception as e:
         print("Best-effort SQL failed:", repr(e), flush=True)
         return False
+
+
+def ensure_photo_image_embedding_schema() -> None:
+    conn = get_conn()
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(f"""
+                    ALTER TABLE photos
+                      ADD COLUMN IF NOT EXISTS image_embedding vector({PHOTO_IMAGE_EMBED_DIM}),
+                      ADD COLUMN IF NOT EXISTS image_embedding_model text,
+                      ADD COLUMN IF NOT EXISTS image_embedding_status text NOT NULL DEFAULT 'pending',
+                      ADD COLUMN IF NOT EXISTS image_embedded_at timestamptz;
+                """)
+
+                cur.execute("""
+                    SELECT format_type(a.atttypid, a.atttypmod) AS formatted_type
+                    FROM pg_attribute a
+                    JOIN pg_class c ON c.oid = a.attrelid
+                    JOIN pg_namespace n ON n.oid = c.relnamespace
+                    WHERE n.nspname = 'public'
+                      AND c.relname = 'photos'
+                      AND a.attname = 'image_embedding'
+                      AND a.attnum > 0
+                      AND NOT a.attisdropped;
+                """)
+                row = cur.fetchone()
+    finally:
+        conn.close()
+
+    expected_type = f"vector({PHOTO_IMAGE_EMBED_DIM})"
+    actual_type = row.get("formatted_type") if row else None
+    if actual_type != expected_type:
+        raise RuntimeError(
+            "photos.image_embedding has the wrong PostgreSQL type: "
+            f"expected {expected_type}, got {actual_type!r}"
+        )
+
+    _TABLE_COLUMNS_CACHE.pop("photos", None)
 
 
 # ============================================================
@@ -1172,6 +1235,7 @@ def create_photo_row(album_ctx: Dict[str, Any], event: Dict[str, Any], source_ke
 
         "compression_status": "pending",
         "face_index_status": "pending",
+        "image_embedding_status": "pending",
         "qwen_status": "pending",
         "search_index_status": "pending",
         "watermark_status": "skipped",
@@ -1424,8 +1488,10 @@ def validate_s3_sources(album_ctx: Dict[str, Any], events: List[Dict[str, Any]])
 def compress_one_photo(
     row: Dict[str, Any],
     photo_cols: Optional[set[str]] = None,
-) -> Tuple[str, str, Optional[str]]:
+    keep_ai_input_local: bool = False,
+) -> Tuple[str, str, Optional[str], Optional[Path]]:
     photo_id = str(row["id"])
+    preserve_tmpdir = False
 
     try:
         tmpdir = LOCAL_WORK / "compress" / photo_id
@@ -1461,7 +1527,7 @@ def compress_one_photo(
                 """,
                 tuple(values),
             )
-            return "ok", photo_id, None
+            return "ok", photo_id, None, None
 
         suffix = Path(source_key).suffix or ".img"
         original_local = tmpdir / f"original{suffix}"
@@ -1498,7 +1564,13 @@ def compress_one_photo(
             tuple(values),
         )
 
-        return "ok", photo_id, None
+        if keep_ai_input_local:
+            try:
+                original_local.unlink(missing_ok=True)
+            except Exception:
+                pass
+        preserve_tmpdir = keep_ai_input_local
+        return "ok", photo_id, None, ai_local if keep_ai_input_local else None
 
     except Exception as e:
         err = repr(e)
@@ -1509,17 +1581,23 @@ def compress_one_photo(
                 updated_at=now()
             WHERE id=%s::uuid;
         """, (err, photo_id))
-        return "failed", photo_id, err
+        return "failed", photo_id, err, None
 
     finally:
         # Keep /tmp from growing during big albums.
-        try:
-            shutil.rmtree(LOCAL_WORK / "compress" / photo_id, ignore_errors=True)
-        except Exception:
-            pass
+        if not preserve_tmpdir:
+            try:
+                shutil.rmtree(LOCAL_WORK / "compress" / photo_id, ignore_errors=True)
+            except Exception:
+                pass
 
 
-def compress_events(album_ctx: Dict[str, Any], events: List[Dict[str, Any]]) -> Dict[str, Any]:
+def compress_events(
+    album_ctx: Dict[str, Any],
+    events: List[Dict[str, Any]],
+    embed_images: bool = False,
+    force_image_embedding: bool = False,
+) -> Dict[str, Any]:
     album_id = album_ctx["album_id"]
     event_ids = [e["event_id"] for e in events]
 
@@ -1541,8 +1619,14 @@ def compress_events(album_ctx: Dict[str, Any], events: List[Dict[str, Any]]) -> 
             "errors": [],
             "parallel": True,
             "workers": 0,
+            "_image_embedding_result": empty_photo_image_embedding_result(),
+            "_image_embedding_attempted_ids": [],
         }
-        print("Compression result:", result, flush=True)
+        print(
+            "Compression result:",
+            {k: v for k, v in result.items() if not k.startswith("_")},
+            flush=True,
+        )
         return result
 
     worker_count = max(1, min(COMPRESS_MAX_WORKERS, len(rows)))
@@ -1552,6 +1636,27 @@ def compress_events(album_ctx: Dict[str, Any], events: List[Dict[str, Any]]) -> 
     failed = 0
     errors = []
     started = time.time()
+    rows_by_id = {str(row["id"]): row for row in rows}
+    pending_embedding_files: List[Tuple[Dict[str, Any], Path]] = []
+    embedding_result = empty_photo_image_embedding_result()
+    embedding_attempted_ids: List[str] = []
+
+    def flush_embedding_batch() -> None:
+        nonlocal embedding_result
+        if not pending_embedding_files:
+            return
+
+        batch_items = list(pending_embedding_files)
+        pending_embedding_files.clear()
+        embedding_attempted_ids.extend(str(photo["id"]) for photo, _ in batch_items)
+        batch_result = embed_photo_image_files(
+            batch_items,
+            source="compression_local_ai_input",
+        )
+        embedding_result = merge_photo_image_embedding_results(
+            embedding_result,
+            batch_result,
+        )
 
     print(
         f"Compression parallel start: rows={len(rows)}, workers={worker_count}, "
@@ -1559,29 +1664,59 @@ def compress_events(album_ctx: Dict[str, Any], events: List[Dict[str, Any]]) -> 
         flush=True,
     )
 
+    submit_batch_size = (
+        PHOTO_IMAGE_EMBED_BATCH_SIZE + worker_count
+        if embed_images
+        else len(rows)
+    )
+    completed = 0
+
     with ThreadPoolExecutor(max_workers=worker_count) as executor:
-        futures = [executor.submit(compress_one_photo, row, photo_cols) for row in rows]
-
-        for i, future in enumerate(as_completed(futures), start=1):
-            try:
-                status, photo_id, err = future.result()
-            except Exception as e:
-                status, photo_id, err = "failed", "unknown", repr(e)
-
-            if status == "ok":
-                ok += 1
-            else:
-                failed += 1
-                if len(errors) < 25:
-                    errors.append({"photo_id": photo_id, "error": err})
-
-            if COMPRESS_LOG_EVERY > 0 and (i % COMPRESS_LOG_EVERY == 0 or i == len(rows)):
-                elapsed = max(0.001, time.time() - started)
-                print(
-                    f"Compression progress: {i}/{len(rows)} done, ok={ok}, failed={failed}, "
-                    f"rate={i / elapsed:.2f} photos/sec",
-                    flush=True,
+        for compression_batch in chunks(rows, submit_batch_size):
+            futures = [
+                executor.submit(
+                    compress_one_photo,
+                    row,
+                    photo_cols,
+                    bool(
+                        embed_images
+                        and (force_image_embedding or row.get("image_embedding") is None)
+                    ),
                 )
+                for row in compression_batch
+            ]
+
+            for future in as_completed(futures):
+                completed += 1
+                try:
+                    status, photo_id, err, ai_local = future.result()
+                except Exception as e:
+                    status, photo_id, err, ai_local = "failed", "unknown", repr(e), None
+
+                if status == "ok":
+                    ok += 1
+                    if ai_local is not None:
+                        pending_embedding_files.append((rows_by_id[photo_id], ai_local))
+                        if len(pending_embedding_files) >= PHOTO_IMAGE_EMBED_BATCH_SIZE:
+                            flush_embedding_batch()
+                else:
+                    failed += 1
+                    if len(errors) < 25:
+                        errors.append({"photo_id": photo_id, "error": err})
+
+                if COMPRESS_LOG_EVERY > 0 and (
+                    completed % COMPRESS_LOG_EVERY == 0
+                    or completed == len(rows)
+                ):
+                    elapsed = max(0.001, time.time() - started)
+                    print(
+                        f"Compression progress: {completed}/{len(rows)} done, "
+                        f"ok={ok}, failed={failed}, "
+                        f"rate={completed / elapsed:.2f} photos/sec",
+                        flush=True,
+                    )
+
+            flush_embedding_batch()
 
     result = {
         "rows": len(rows),
@@ -1592,8 +1727,344 @@ def compress_events(album_ctx: Dict[str, Any], events: List[Dict[str, Any]]) -> 
         "workers": worker_count,
         "seconds": round(time.time() - started, 2),
         "photos_per_second": round(len(rows) / max(0.001, time.time() - started), 3),
+        "_image_embedding_result": embedding_result,
+        "_image_embedding_attempted_ids": embedding_attempted_ids,
     }
-    print("Compression result:", result, flush=True)
+    print(
+        "Compression result:",
+        {k: v for k, v in result.items() if not k.startswith("_")},
+        flush=True,
+    )
+    return result
+
+
+# ============================================================
+# FULL-IMAGE EMBEDDINGS
+# ============================================================
+
+def empty_photo_image_embedding_result() -> Dict[str, Any]:
+    return {
+        "rows": 0,
+        "ok": 0,
+        "failed": 0,
+        "errors": [],
+        "embedding_model": PHOTO_IMAGE_EMBED_MODEL_ID,
+        "embedding_dim": PHOTO_IMAGE_EMBED_DIM,
+        "batch_size": PHOTO_IMAGE_EMBED_BATCH_SIZE,
+        "sources": {},
+    }
+
+
+def merge_photo_image_embedding_results(
+    left: Dict[str, Any],
+    right: Dict[str, Any],
+) -> Dict[str, Any]:
+    merged = empty_photo_image_embedding_result()
+    merged["rows"] = int(left.get("rows") or 0) + int(right.get("rows") or 0)
+    merged["ok"] = int(left.get("ok") or 0) + int(right.get("ok") or 0)
+    merged["failed"] = int(left.get("failed") or 0) + int(right.get("failed") or 0)
+    merged["errors"] = list(left.get("errors") or []) + list(right.get("errors") or [])
+    merged["errors"] = merged["errors"][:25]
+
+    sources: Dict[str, int] = {}
+    for result in (left, right):
+        for source, count in (result.get("sources") or {}).items():
+            sources[source] = sources.get(source, 0) + int(count or 0)
+    merged["sources"] = sources
+    return merged
+
+
+def mark_photo_image_embedding_status(photo_ids: List[str], status: str) -> None:
+    if not photo_ids:
+        return
+
+    execute_sql_best_effort("""
+        UPDATE photos
+        SET image_embedding_status=%s,
+            updated_at=now()
+        WHERE id = ANY(%s::uuid[]);
+    """, (status, photo_ids))
+
+
+def load_photo_image_embed_model():
+    global _PHOTO_IMAGE_EMBED_MODEL, _PHOTO_IMAGE_EMBED_PROCESSOR
+
+    if (
+        _PHOTO_IMAGE_EMBED_MODEL is not None
+        and _PHOTO_IMAGE_EMBED_PROCESSOR is not None
+    ):
+        return _PHOTO_IMAGE_EMBED_MODEL, _PHOTO_IMAGE_EMBED_PROCESSOR
+
+    import torch
+    from transformers import AutoModel, AutoProcessor
+
+    print(
+        f"Loading full-image embedding model: {PHOTO_IMAGE_EMBED_MODEL_ID}",
+        flush=True,
+    )
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    processor = AutoProcessor.from_pretrained(PHOTO_IMAGE_EMBED_MODEL_ID)
+    model = AutoModel.from_pretrained(
+        PHOTO_IMAGE_EMBED_MODEL_ID,
+        torch_dtype=torch.float16 if device == "cuda" else torch.float32,
+    )
+
+    if not callable(getattr(model, "get_image_features", None)):
+        raise RuntimeError(
+            f"{PHOTO_IMAGE_EMBED_MODEL_ID} does not expose get_image_features()"
+        )
+    if not callable(getattr(model, "get_text_features", None)):
+        raise RuntimeError(
+            f"{PHOTO_IMAGE_EMBED_MODEL_ID} does not expose get_text_features(); "
+            "image and future search text embeddings must use the same model"
+        )
+
+    text_config = getattr(model.config, "text_config", None)
+    configured_dim = (
+        getattr(text_config, "projection_size", None)
+        or getattr(text_config, "hidden_size", None)
+    )
+    if configured_dim and int(configured_dim) != PHOTO_IMAGE_EMBED_DIM:
+        raise RuntimeError(
+            f"{PHOTO_IMAGE_EMBED_MODEL_ID} produces {configured_dim}-dimensional "
+            f"embeddings, but photos.image_embedding is vector({PHOTO_IMAGE_EMBED_DIM})"
+        )
+
+    model.to(device)
+    model.eval()
+
+    _PHOTO_IMAGE_EMBED_MODEL = model
+    _PHOTO_IMAGE_EMBED_PROCESSOR = processor
+    print(
+        f"Full-image embedding model loaded on {device}; "
+        f"dimension={PHOTO_IMAGE_EMBED_DIM}",
+        flush=True,
+    )
+    return model, processor
+
+
+def embed_photo_image_files(
+    items: List[Tuple[Dict[str, Any], Path]],
+    source: str,
+) -> Dict[str, Any]:
+    import torch
+
+    result = empty_photo_image_embedding_result()
+    result["rows"] = len(items)
+    result["sources"] = {source: len(items)}
+    if not items:
+        return result
+
+    photo_ids = [str(photo["id"]) for photo, _ in items]
+    mark_photo_image_embedding_status(photo_ids, "processing")
+
+    prepared: List[Dict[str, Any]] = []
+    images: List[Image.Image] = []
+
+    try:
+        for photo, local_path in items:
+            try:
+                images.append(read_image_any(local_path))
+                prepared.append(photo)
+            except Exception as e:
+                photo_id = str(photo["id"])
+                result["failed"] += 1
+                result["errors"].append({
+                    "photo_id": photo_id,
+                    "file_name": photo.get("file_name"),
+                    "error": repr(e),
+                })
+                mark_photo_image_embedding_status([photo_id], "failed")
+
+        if not images:
+            return result
+
+        try:
+            model, processor = load_photo_image_embed_model()
+            device = next(model.parameters()).device
+            inputs = processor(images=images, return_tensors="pt")
+            inputs = {
+                key: value.to(device) if hasattr(value, "to") else value
+                for key, value in inputs.items()
+            }
+
+            with torch.inference_mode():
+                features = model.get_image_features(**inputs)
+                if hasattr(features, "pooler_output"):
+                    features = features.pooler_output
+                features = features / features.norm(
+                    p=2,
+                    dim=-1,
+                    keepdim=True,
+                ).clamp_min(1e-12)
+
+            if features.ndim != 2 or features.shape[1] != PHOTO_IMAGE_EMBED_DIM:
+                raise RuntimeError(
+                    f"Unexpected image embedding shape {tuple(features.shape)}; "
+                    f"expected (*, {PHOTO_IMAGE_EMBED_DIM})"
+                )
+
+            vectors = features.detach().cpu().numpy().astype(np.float32)
+            update_rows = [
+                (
+                    str(photo["id"]),
+                    vector_to_pg(vectors[index]),
+                    PHOTO_IMAGE_EMBED_MODEL_ID,
+                )
+                for index, photo in enumerate(prepared)
+            ]
+
+            conn = get_conn()
+            try:
+                with conn:
+                    with conn.cursor() as cur:
+                        execute_values(cur, """
+                            UPDATE photos AS p
+                            SET image_embedding=v.embedding::vector,
+                                image_embedding_model=v.embedding_model,
+                                image_embedding_status='completed',
+                                image_embedded_at=now(),
+                                updated_at=now()
+                            FROM (VALUES %s) AS v(photo_id, embedding, embedding_model)
+                            WHERE p.id=v.photo_id::uuid;
+                        """, update_rows, template="(%s,%s,%s)")
+            finally:
+                conn.close()
+
+            result["ok"] += len(prepared)
+            del inputs, features
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+        except Exception as e:
+            failed_ids = [str(photo["id"]) for photo in prepared]
+            result["failed"] += len(prepared)
+            result["errors"].append({
+                "batch_photo_ids": failed_ids[:25],
+                "error": repr(e),
+            })
+            mark_photo_image_embedding_status(failed_ids, "failed")
+
+    finally:
+        for image in images:
+            try:
+                image.close()
+            except Exception:
+                pass
+        for _, local_path in items:
+            try:
+                shutil.rmtree(local_path.parent, ignore_errors=True)
+            except Exception:
+                pass
+
+    result["errors"] = result["errors"][:25]
+    return result
+
+
+def download_photo_image_input(photo: Dict[str, Any]) -> Path:
+    photo_id = str(photo["id"])
+    keys = []
+    for key in (photo.get("ai_input_s3_key"), photo.get("original_s3_key")):
+        if key and key not in keys:
+            keys.append(key)
+
+    if not keys:
+        raise RuntimeError("missing ai_input_s3_key and original_s3_key")
+
+    errors = []
+    tmpdir = LOCAL_WORK / "image-embedding" / photo_id
+    tmpdir.mkdir(parents=True, exist_ok=True)
+
+    for key in keys:
+        suffix = Path(key).suffix or ".img"
+        local_path = tmpdir / f"input{suffix}"
+        try:
+            return download_file(key, local_path)
+        except Exception as e:
+            errors.append(f"{key}: {repr(e)}")
+
+    raise RuntimeError("all image embedding S3 inputs failed: " + "; ".join(errors))
+
+
+def image_embed_events(
+    album_ctx: Dict[str, Any],
+    events: List[Dict[str, Any]],
+    force: bool = False,
+    exclude_photo_ids: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    album_id = album_ctx["album_id"]
+    event_ids = [e["event_id"] for e in events]
+    excluded = exclude_photo_ids or []
+
+    where_parts = [
+        "p.album_id=%s::uuid",
+        "p.album_event_id = ANY(%s::uuid[])",
+        "COALESCE(p.is_deleted,false)=false",
+        "(NULLIF(p.ai_input_s3_key,'') IS NOT NULL OR NULLIF(p.original_s3_key,'') IS NOT NULL)",
+    ]
+    params: List[Any] = [album_id, event_ids]
+
+    if not force:
+        where_parts.append("p.image_embedding IS NULL")
+    if excluded:
+        where_parts.append("NOT (p.id = ANY(%s::uuid[]))")
+        params.append(excluded)
+
+    rows = db_all(f"""
+        SELECT p.*
+        FROM photos p
+        WHERE {" AND ".join(where_parts)}
+        ORDER BY p.created_at;
+    """, tuple(params))
+
+    result = empty_photo_image_embedding_result()
+    if not rows:
+        print("Full-image embedding result:", result, flush=True)
+        return result
+
+    started = time.time()
+    worker_count = max(
+        1,
+        min(PHOTO_IMAGE_EMBED_DOWNLOAD_WORKERS, PHOTO_IMAGE_EMBED_BATCH_SIZE),
+    )
+
+    for batch in chunks(rows, PHOTO_IMAGE_EMBED_BATCH_SIZE):
+        downloaded: List[Tuple[Dict[str, Any], Path]] = []
+
+        with ThreadPoolExecutor(max_workers=min(worker_count, len(batch))) as executor:
+            future_to_photo = {
+                executor.submit(download_photo_image_input, photo): photo
+                for photo in batch
+            }
+            for future in as_completed(future_to_photo):
+                photo = future_to_photo[future]
+                try:
+                    downloaded.append((photo, future.result()))
+                except Exception as e:
+                    photo_id = str(photo["id"])
+                    failure = empty_photo_image_embedding_result()
+                    failure["rows"] = 1
+                    failure["failed"] = 1
+                    failure["sources"] = {"s3_download": 1}
+                    failure["errors"] = [{
+                        "photo_id": photo_id,
+                        "file_name": photo.get("file_name"),
+                        "error": repr(e),
+                    }]
+                    result = merge_photo_image_embedding_results(result, failure)
+                    mark_photo_image_embedding_status([photo_id], "failed")
+                    shutil.rmtree(
+                        LOCAL_WORK / "image-embedding" / photo_id,
+                        ignore_errors=True,
+                    )
+
+        batch_result = embed_photo_image_files(downloaded, source="s3_download")
+        result = merge_photo_image_embedding_results(result, batch_result)
+
+    result["seconds"] = round(time.time() - started, 2)
+    result["force"] = force
+    result["download_workers"] = worker_count
+    print("Full-image embedding result:", result, flush=True)
     return result
 
 
@@ -5146,10 +5617,11 @@ def normalize_steps(payload: Dict[str, Any]) -> Dict[str, bool]:
     Correct order:
     1. ingest
     2. compress
-    3. face_index
-    4. safe_people_reconcile
-    5. crop_person_covers
-    6. enqueue_qwen / Gemma
+    3. image_embedding
+    4. face_index
+    5. safe_people_reconcile
+    6. crop_person_covers
+    7. enqueue_qwen / Gemma
 
     Important:
     - Qwen/Gemma must be enqueued after people are reconciled.
@@ -5165,6 +5637,7 @@ def normalize_steps(payload: Dict[str, Any]) -> Dict[str, bool]:
     default_steps = {
         "ingest": True,
         "compress": bool(full_mode),
+        "image_embedding": bool(full_mode),
         "face_index": bool(full_mode),
         "safe_people_reconcile": bool(full_mode),
         "crop_person_covers": bool(full_mode),
@@ -5181,6 +5654,8 @@ def normalize_steps(payload: Dict[str, Any]) -> Dict[str, bool]:
     supplied = payload.get("steps")
     if isinstance(supplied, dict):
         merged = {**default_steps, **supplied}
+        if "image_embedding" not in supplied and "image_embeddings" in supplied:
+            merged["image_embedding"] = supplied["image_embeddings"]
     else:
         merged = default_steps
 
@@ -5220,6 +5695,10 @@ def process_album_events(job_id: str, payload: Dict[str, Any]) -> Dict[str, Any]
             "steps": steps,
             "compress_max_workers": COMPRESS_MAX_WORKERS,
             "compress_reuse_existing_ai_input": COMPRESS_REUSE_EXISTING_AI_INPUT,
+            "photo_image_embed_model_id": PHOTO_IMAGE_EMBED_MODEL_ID,
+            "photo_image_embed_dim": PHOTO_IMAGE_EMBED_DIM,
+            "photo_image_embed_batch_size": PHOTO_IMAGE_EMBED_BATCH_SIZE,
+            "photo_image_embed_download_workers": PHOTO_IMAGE_EMBED_DOWNLOAD_WORKERS,
             "s3_validation_mode": S3_VALIDATION_MODE,
             "face_index_log_every": FACE_INDEX_LOG_EVERY,
             "cover_max_workers": COVER_MAX_WORKERS,
@@ -5247,6 +5726,15 @@ def process_album_events(job_id: str, payload: Dict[str, Any]) -> Dict[str, Any]
     update_job_status(job_id, "running", "restore_album", "Restoring album context")
     with stage_timer("restore_album"):
         album_ctx = restore_album_context(album_slug, album_name=album_name)
+
+    update_job_status(
+        job_id,
+        "running",
+        "image_embedding_schema",
+        "Ensuring full-image embedding columns",
+    )
+    with stage_timer("image_embedding_schema"):
+        ensure_photo_image_embedding_schema()
 
     update_job_status(job_id, "running", "upsert_events", "Creating/restoring event rows")
     with stage_timer("upsert_events"):
@@ -5309,7 +5797,15 @@ def process_album_events(job_id: str, payload: Dict[str, Any]) -> Dict[str, Any]
     else:
         print("[STAGE_SKIP] ingest=false; skipping S3 scan and S3 validation", flush=True)
 
-    # 2. Generate AI input images.
+    force_image_embedding = bool(
+        payload.get("force", False)
+        or payload.get("force_image_embedding", False)
+    )
+    inline_embedding_result = empty_photo_image_embedding_result()
+    inline_embedding_attempted_ids: List[str] = []
+
+    # 2. Generate AI input images. Newly generated local files are retained only long
+    # enough to feed full-image embedding batches while other compression workers run.
     if steps.get("compress", False):
         update_job_status(
             job_id,
@@ -5318,12 +5814,50 @@ def process_album_events(job_id: str, payload: Dict[str, Any]) -> Dict[str, Any]
             "Generating AI input images",
         )
         with stage_timer("compress"):
-            results["steps"]["compress"] = compress_events(album_ctx, db_events)
+            compression_result = compress_events(
+                album_ctx,
+                db_events,
+                embed_images=steps.get("image_embedding", False),
+                force_image_embedding=force_image_embedding,
+            )
+            inline_embedding_result = compression_result.pop(
+                "_image_embedding_result",
+                empty_photo_image_embedding_result(),
+            )
+            inline_embedding_attempted_ids = compression_result.pop(
+                "_image_embedding_attempted_ids",
+                [],
+            )
+            results["steps"]["compress"] = compression_result
         print_db_progress_snapshot(album_slug, "after_compress")
     else:
         print("[STAGE_SKIP] compress=false", flush=True)
 
-    # 3. Detect faces and write face embeddings.
+    # 3. Backfill full-image embeddings for photos that were already compressed or
+    # whose compression fast path reused an existing S3 AI-input object.
+    if steps.get("image_embedding", False):
+        update_job_status(
+            job_id,
+            "running",
+            "image_embedding",
+            "Generating batched SigLIP 2 full-image embeddings",
+        )
+        with stage_timer("image_embedding"):
+            backfill_embedding_result = image_embed_events(
+                album_ctx,
+                db_events,
+                force=force_image_embedding,
+                exclude_photo_ids=inline_embedding_attempted_ids,
+            )
+            results["steps"]["image_embedding"] = merge_photo_image_embedding_results(
+                inline_embedding_result,
+                backfill_embedding_result,
+            )
+        print_db_progress_snapshot(album_slug, "after_image_embedding")
+    else:
+        print("[STAGE_SKIP] image_embedding=false", flush=True)
+
+    # 4. Detect faces and write face embeddings.
     if steps.get("face_index", False):
         update_job_status(
             job_id,
@@ -5337,7 +5871,7 @@ def process_album_events(job_id: str, payload: Dict[str, Any]) -> Dict[str, Any]
     else:
         print("[STAGE_SKIP] face_index=false", flush=True)
 
-    # 4. IMPORTANT: reconcile people before Qwen/Gemma enqueue.
+    # 5. IMPORTANT: reconcile people before Qwen/Gemma enqueue.
     # Do not crop covers inside this call; cover crop is its own explicit step below
     # so existing albums can be backfilled without rerunning reconciliation.
     if steps.get("safe_people_reconcile", False):
@@ -5358,7 +5892,7 @@ def process_album_events(job_id: str, payload: Dict[str, Any]) -> Dict[str, Any]
     else:
         print("[STAGE_SKIP] safe_people_reconcile=false", flush=True)
 
-    # 5. Generate/backfill people cover images.
+    # 6. Generate/backfill people cover images.
     # This writes people.cover_face_s3_key.
     if steps.get("crop_person_covers", False):
         update_job_status(
@@ -5395,7 +5929,7 @@ def process_album_events(job_id: str, payload: Dict[str, Any]) -> Dict[str, Any]
             results["steps"]["build_duplicate_candidates"] = build_duplicate_candidates(album_ctx)
         print_db_progress_snapshot(album_slug, "after_build_duplicate_candidates")
 
-    # 6. Only now enqueue Qwen/Gemma, after faces have person_id and covers exist.
+    # 7. Only now enqueue Qwen/Gemma, after faces have person_id and covers exist.
     if steps.get("enqueue_qwen", False):
         update_job_status(
             job_id,
