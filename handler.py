@@ -984,6 +984,79 @@ def is_image_key(key: str) -> bool:
     # Be liberal only inside originals for odd photographer extensions.
     return "/originals/" in ("/" + str(key).strip().lstrip("/"))
 
+
+def add_s3_key_candidate(candidates: List[Tuple[str, str]], key_type: str, key: Any) -> None:
+    if not isinstance(key, str):
+        return
+
+    normalized = key.strip().lstrip("/")
+    if normalized and all(existing_key != normalized for _, existing_key in candidates):
+        candidates.append((key_type, normalized))
+
+
+def photo_file_extensions(photo: Dict[str, Any]) -> List[str]:
+    extensions: List[str] = []
+    for name_field in ("file_name", "original_file_name"):
+        name = photo.get(name_field)
+        if not isinstance(name, str):
+            continue
+
+        ext = Path(name).suffix
+        if ext and ext.lower() in IMAGE_EXTS:
+            for candidate in (ext, ext.lower(), ext.upper()):
+                if candidate not in extensions:
+                    extensions.append(candidate)
+
+    return extensions
+
+
+def s3_key_extension_variants(photo: Dict[str, Any], key: str) -> List[str]:
+    suffix = Path(key).suffix
+    if not suffix:
+        return []
+
+    base = key[: -len(suffix)]
+    variants: List[str] = []
+    for ext in photo_file_extensions(photo):
+        if ext.lower() == suffix.lower():
+            continue
+        variant = f"{base}{ext}"
+        if variant != key and variant not in variants:
+            variants.append(variant)
+
+    return variants
+
+
+def source_s3_key_candidates(photo: Dict[str, Any]) -> List[Tuple[str, str]]:
+    candidates: List[Tuple[str, str]] = []
+    for key_type, key in (
+        ("original_s3_key", photo.get("original_s3_key")),
+        ("source_s3_key", photo.get("source_s3_key")),
+    ):
+        if not isinstance(key, str) or not key.strip():
+            continue
+
+        normalized = key.strip().lstrip("/")
+        add_s3_key_candidate(candidates, key_type, normalized)
+        for variant in s3_key_extension_variants(photo, normalized):
+            add_s3_key_candidate(candidates, f"{key_type}_extension_variant", variant)
+
+    return candidates
+
+
+def image_embedding_s3_key_candidates(photo: Dict[str, Any]) -> List[Tuple[str, str]]:
+    candidates: List[Tuple[str, str]] = []
+    compression_status = str(photo.get("compression_status") or "").lower()
+    if compression_status in {"", "completed"}:
+        add_s3_key_candidate(candidates, "ai_input_s3_key", photo.get("ai_input_s3_key"))
+
+    add_s3_key_candidate(candidates, "clean_preview_s3_key", photo.get("clean_preview_s3_key"))
+    for key_type, key in source_s3_key_candidates(photo):
+        add_s3_key_candidate(candidates, key_type, key)
+
+    return candidates
+
+
 def is_generated_original_key(key: str) -> bool:
     return bool(UUID_PREFIX_RE.match(Path(key).name))
 
@@ -1565,9 +1638,10 @@ def compress_one_photo(
         tmpdir = LOCAL_WORK / "compress" / photo_id
         tmpdir.mkdir(parents=True, exist_ok=True)
 
-        source_key = row.get("original_s3_key") or row.get("source_s3_key")
-        if not source_key:
+        source_candidates = source_s3_key_candidates(row)
+        if not source_candidates:
             raise RuntimeError("missing original/source S3 key")
+        stored_source_key = source_candidates[0][1]
 
         ai_key = row.get("ai_input_s3_key")
         if not ai_key:
@@ -1597,11 +1671,31 @@ def compress_one_photo(
             )
             return "ok", photo_id, None, None
 
-        suffix = Path(source_key).suffix or ".img"
-        original_local = tmpdir / f"original{suffix}"
         ai_local = tmpdir / "ai.webp"
 
-        download_file(source_key, original_local)
+        source_key = stored_source_key
+        original_local: Optional[Path] = None
+        download_errors: List[str] = []
+        for attempt, (source_key_type, candidate_key) in enumerate(source_candidates, start=1):
+            suffix = Path(candidate_key).suffix or ".img"
+            candidate_local = tmpdir / f"original-{attempt}{suffix}"
+            try:
+                original_local = download_file(candidate_key, candidate_local)
+                source_key = candidate_key
+                if candidate_key != stored_source_key:
+                    print(
+                        "Compression source key repaired: "
+                        f"photo_id={photo_id} key_type={source_key_type} "
+                        f"old={stored_source_key} new={candidate_key}",
+                        flush=True,
+                    )
+                break
+            except Exception as e:
+                download_errors.append(f"{candidate_key}: {repr(e)}")
+
+        if original_local is None:
+            raise RuntimeError("all source S3 inputs failed: " + "; ".join(download_errors))
+
         width, height = save_ai_input_webp(original_local, ai_local)
         upload_file(ai_local, ai_key, "image/webp")
 
@@ -1620,6 +1714,13 @@ def compress_one_photo(
         if "height" in cols:
             set_parts.append("height=%s")
             values.append(height)
+        if source_key != stored_source_key:
+            if "original_s3_key" in cols:
+                set_parts.append("original_s3_key=%s")
+                values.append(source_key)
+            if "source_s3_key" in cols:
+                set_parts.append("source_s3_key=%s")
+                values.append(source_key)
 
         values.append(photo_id)
 
@@ -2290,16 +2391,10 @@ def download_photo_image_input(
     total_batches: Optional[int] = None,
 ) -> Path:
     photo_id = str(photo["id"])
-    keys: List[Tuple[str, str]] = []
-    for key_type, key in (
-        ("ai_input_s3_key", photo.get("ai_input_s3_key")),
-        ("original_s3_key", photo.get("original_s3_key")),
-    ):
-        if key and all(existing_key != key for _, existing_key in keys):
-            keys.append((key_type, key))
+    keys = image_embedding_s3_key_candidates(photo)
 
     if not keys:
-        raise RuntimeError("missing ai_input_s3_key and original_s3_key")
+        raise RuntimeError("missing usable image S3 key")
 
     errors = []
     tmpdir = LOCAL_WORK / "image-embedding" / photo_id
@@ -2387,31 +2482,40 @@ def image_embed_events(
         "p.album_id=%s::uuid",
         "p.album_event_id = ANY(%s::uuid[])",
         "COALESCE(p.is_deleted,false)=false",
-        "(NULLIF(p.ai_input_s3_key,'') IS NOT NULL OR NULLIF(p.original_s3_key,'') IS NOT NULL)",
+        """
+        (
+          (p.compression_status = 'completed' AND NULLIF(p.ai_input_s3_key,'') IS NOT NULL)
+          OR NULLIF(p.clean_preview_s3_key,'') IS NOT NULL
+          OR NULLIF(p.original_s3_key,'') IS NOT NULL
+          OR NULLIF(p.source_s3_key,'') IS NOT NULL
+        )
+        """,
     ]
     params: List[Any] = [album_id, event_ids]
 
     scope_stats = db_one("""
-        SELECT
-          COUNT(*) AS eligible_photos,
-          COUNT(*) FILTER (WHERE p.image_embedding IS NULL) AS missing_vectors,
-          COUNT(*) FILTER (
-            WHERE p.image_embedding IS NOT NULL
-              AND p.image_embedding_model = %s
-          ) AS existing_current_model_vectors,
-          COUNT(*) FILTER (
-            WHERE p.image_embedding IS NOT NULL
-              AND p.image_embedding_model IS DISTINCT FROM %s
-          ) AS existing_other_model_vectors
-        FROM photos p
-        WHERE p.album_id=%s::uuid
-          AND p.album_event_id = ANY(%s::uuid[])
-          AND COALESCE(p.is_deleted,false)=false
-          AND (
-            NULLIF(p.ai_input_s3_key,'') IS NOT NULL
-            OR NULLIF(p.original_s3_key,'') IS NOT NULL
-          );
-    """, (
+                SELECT
+                    COUNT(*) AS eligible_photos,
+                    COUNT(*) FILTER (WHERE p.image_embedding IS NULL) AS missing_vectors,
+                    COUNT(*) FILTER (
+                        WHERE p.image_embedding IS NOT NULL
+                            AND p.image_embedding_model = %s
+                    ) AS existing_current_model_vectors,
+                    COUNT(*) FILTER (
+                        WHERE p.image_embedding IS NOT NULL
+                            AND p.image_embedding_model IS DISTINCT FROM %s
+                    ) AS existing_other_model_vectors
+                FROM photos p
+                WHERE p.album_id=%s::uuid
+                    AND p.album_event_id = ANY(%s::uuid[])
+                    AND COALESCE(p.is_deleted,false)=false
+                    AND (
+                        (p.compression_status = 'completed' AND NULLIF(p.ai_input_s3_key,'') IS NOT NULL)
+                        OR NULLIF(p.clean_preview_s3_key,'') IS NOT NULL
+                        OR NULLIF(p.original_s3_key,'') IS NOT NULL
+                        OR NULLIF(p.source_s3_key,'') IS NOT NULL
+                    );
+        """, (
         PHOTO_IMAGE_EMBED_MODEL_ID,
         PHOTO_IMAGE_EMBED_MODEL_ID,
         album_id,
