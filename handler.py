@@ -1027,6 +1027,21 @@ def s3_key_extension_variants(photo: Dict[str, Any], key: str) -> List[str]:
     return variants
 
 
+def s3_key_path_variants(key: str) -> List[str]:
+    normalized = str(key or "").strip().lstrip("/")
+    if not normalized:
+        return []
+
+    variants = [normalized]
+    collapsed = normalized
+    while "/originals/originals/" in collapsed:
+        collapsed = collapsed.replace("/originals/originals/", "/originals/")
+        if collapsed and collapsed not in variants:
+            variants.append(collapsed)
+
+    return variants
+
+
 def source_s3_key_candidates(photo: Dict[str, Any]) -> List[Tuple[str, str]]:
     candidates: List[Tuple[str, str]] = []
     for key_type, key in (
@@ -1037,9 +1052,11 @@ def source_s3_key_candidates(photo: Dict[str, Any]) -> List[Tuple[str, str]]:
             continue
 
         normalized = key.strip().lstrip("/")
-        add_s3_key_candidate(candidates, key_type, normalized)
-        for variant in s3_key_extension_variants(photo, normalized):
-            add_s3_key_candidate(candidates, f"{key_type}_extension_variant", variant)
+        for path_variant in s3_key_path_variants(normalized):
+            path_key_type = key_type if path_variant == normalized else f"{key_type}_path_variant"
+            add_s3_key_candidate(candidates, path_key_type, path_variant)
+            for ext_variant in s3_key_extension_variants(photo, path_variant):
+                add_s3_key_candidate(candidates, f"{path_key_type}_extension_variant", ext_variant)
 
     return candidates
 
@@ -1633,6 +1650,7 @@ def compress_one_photo(
 ) -> Tuple[str, str, Optional[str], Optional[Path]]:
     photo_id = str(row["id"])
     preserve_tmpdir = False
+    source_candidates: List[Tuple[str, str]] = []
 
     try:
         tmpdir = LOCAL_WORK / "compress" / photo_id
@@ -1694,6 +1712,12 @@ def compress_one_photo(
                 download_errors.append(f"{candidate_key}: {repr(e)}")
 
         if original_local is None:
+            print(
+                "Compression source download failed: "
+                f"photo_id={photo_id} file_name={row.get('file_name')} "
+                f"candidates={source_candidates} errors={download_errors[:8]}",
+                flush=True,
+            )
             raise RuntimeError("all source S3 inputs failed: " + "; ".join(download_errors))
 
         width, height = save_ai_input_webp(original_local, ai_local)
@@ -1743,6 +1767,13 @@ def compress_one_photo(
 
     except Exception as e:
         err = repr(e)
+        print(
+            "Compression photo failed: "
+            f"photo_id={photo_id} file_name={row.get('file_name')} "
+            f"original_s3_key={row.get('original_s3_key')} source_s3_key={row.get('source_s3_key')} "
+            f"candidates={source_candidates[:8]} error={err}",
+            flush=True,
+        )
         execute_sql_best_effort("""
             UPDATE photos
             SET compression_status='failed',
